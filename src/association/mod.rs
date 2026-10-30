@@ -8,6 +8,7 @@ use crate::chunk::chunk_cookie_ack::ChunkCookieAck;
 use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
 use crate::chunk::chunk_error::ChunkError;
 use crate::chunk::chunk_forward_tsn::{ChunkForwardTsn, ChunkForwardTsnStream};
+use crate::chunk::chunk_header::CHUNK_HEADER_SIZE;
 use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
 use crate::chunk::chunk_heartbeat_ack::ChunkHeartbeatAck;
 use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
@@ -15,6 +16,7 @@ use crate::chunk::chunk_init::{ChunkInit, ChunkInitAck};
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::chunk::chunk_reconfig::ChunkReconfig;
 use crate::chunk::chunk_selective_ack::ChunkSelectiveAck;
+use crate::chunk::chunk_selective_ack::SELECTIVE_ACK_HEADER_SIZE;
 use crate::chunk::chunk_shutdown::ChunkShutdown;
 use crate::chunk::chunk_shutdown_ack::ChunkShutdownAck;
 use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
@@ -72,6 +74,9 @@ mod window_ack_test;
 
 #[cfg(test)]
 mod persistent_rto_test;
+
+#[cfg(test)]
+mod duplicate_sack_test;
 
 /// Reasons why an association might be lost
 #[non_exhaustive]
@@ -2369,9 +2374,16 @@ impl Association {
         self.stats.inc_datas();
 
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
+        if !can_push {
+            // Record the duplicate without passing it through stream reassembly.
+            // RFC 9260 section 6.2 requires an immediate SACK for duplicate DATA.
+            let max_reports = self.sack_report_capacity();
+            self.payload_queue.record_duplicate(d.tsn, max_reports);
+            return self.handle_peer_last_tsn_and_acknowledgement(true);
+        }
         let mut stream_handle_data = false;
         let mut defer_stream_data = false;
-        if can_push && self.data_is_above_pending_reset(d) {
+        if self.data_is_above_pending_reset(d) {
             if self.get_my_receiver_window_credit() > 0 {
                 defer_stream_data = true;
             } else if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
@@ -2384,7 +2396,7 @@ impl Association {
                     defer_stream_data = true;
                 }
             }
-        } else if can_push {
+        } else {
             if self.get_or_create_stream(d.stream_identifier).is_some() {
                 if self.get_my_receiver_window_credit() > 0 {
                     // Pass the new chunk to stream level as soon as it arrives
@@ -4049,12 +4061,25 @@ impl Association {
         }
     }
 
+    fn sack_report_capacity(&self) -> usize {
+        let chunk_budget = (self.mtu as usize)
+            .saturating_sub(COMMON_HEADER_SIZE as usize)
+            .min(u16::MAX as usize);
+        chunk_budget.saturating_sub(CHUNK_HEADER_SIZE + SELECTIVE_ACK_HEADER_SIZE) / 4
+    }
+
     fn create_selective_ack_chunk(&mut self) -> ChunkSelectiveAck {
+        let capacity = self.sack_report_capacity();
+        let mut gap_ack_blocks = self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn);
+        // RFC 9260 section 6.7 prioritizes the lowest gap blocks within PMTU.
+        gap_ack_blocks.truncate(capacity);
+        let mut duplicate_tsn = self.payload_queue.pop_duplicates();
+        duplicate_tsn.truncate(capacity.saturating_sub(gap_ack_blocks.len()));
         ChunkSelectiveAck {
             cumulative_tsn_ack: self.peer_last_tsn,
             advertised_receiver_window_credit: self.get_my_receiver_window_credit(),
-            gap_ack_blocks: self.payload_queue.get_gap_ack_blocks(self.peer_last_tsn),
-            duplicate_tsn: self.payload_queue.pop_duplicates(),
+            gap_ack_blocks,
+            duplicate_tsn,
         }
     }
 

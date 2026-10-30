@@ -105,6 +105,13 @@ impl PayloadQueue {
         self.chunk_map.get_mut(&tsn)
     }
 
+    /// Record one duplicate occurrence within the SACK packet's report budget.
+    pub(crate) fn record_duplicate(&mut self, tsn: u32, max_reports: usize) {
+        if self.dup_tsn.len() < max_reports {
+            self.dup_tsn.push(tsn);
+        }
+    }
+
     /// popDuplicates returns an array of TSN values that were found duplicate.
     pub(crate) fn pop_duplicates(&mut self) -> Vec<u32> {
         core::mem::take(&mut self.dup_tsn)
