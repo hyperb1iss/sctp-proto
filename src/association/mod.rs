@@ -67,6 +67,9 @@ mod timer;
 #[cfg(test)]
 mod association_test;
 
+#[cfg(test)]
+mod window_ack_test;
+
 /// Reasons why an association might be lost
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -3556,7 +3559,10 @@ impl Association {
             self.timers
                 .restart_if_stale(Timer::T3RTX, now, self.rto_mgr.get_rto());
 
-            for p in &self.bundle_data_chunks_into_packets(chunks) {
+            let remaining_window = (self.cwnd as usize)
+                .saturating_sub(self.inflight_queue.get_num_bytes())
+                .min(self.rwnd as usize);
+            for p in &self.bundle_data_chunks_into_packets(chunks, remaining_window) {
                 if let Ok(raw) = p.marshal() {
                     raw_packets.push(raw);
                 } else {
@@ -3870,7 +3876,7 @@ impl Association {
             i += 1;
         }
 
-        self.bundle_data_chunks_into_packets(chunks)
+        self.bundle_data_chunks_into_packets(chunks, (awnd as usize).saturating_sub(bytes_to_send))
     }
 
     /// pop_pending_data_chunks_to_send pops chunks from the pending queues as many as
@@ -3932,7 +3938,21 @@ impl Association {
     /// bundle_data_chunks_into_packets packs DATA chunks into packets. It tries to bundle
     /// DATA chunks into a packet so long as the resulting packet size does not exceed
     /// the path MTU.
-    fn bundle_data_chunks_into_packets(&self, chunks: Vec<ChunkPayloadData>) -> Vec<Packet> {
+    fn bundle_data_chunks_into_packets(
+        &self,
+        mut chunks: Vec<ChunkPayloadData>,
+        remaining_window: usize,
+    ) -> Vec<Packet> {
+        // RFC 9260 section 6.1 permits requesting an immediate SACK when a
+        // transmission fills the congestion or receiver window. If another
+        // full fragment cannot fit, a delayed ACK can leave the sender idle,
+        // including when the next message has not been queued yet.
+        if remaining_window < self.max_payload_size as usize {
+            if let Some(last) = chunks.last_mut() {
+                last.immediate_sack = true;
+            }
+        }
+
         let mut packets = vec![];
         let mut chunks_to_send = vec![];
         let mut bytes_in_packet = COMMON_HEADER_SIZE;
