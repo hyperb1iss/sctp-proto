@@ -85,10 +85,12 @@ impl TimerTable {
     }
 
     pub fn start(&mut self, timer: Timer, now: Instant, interval: u64) {
-        let interval = if timer == Timer::Ack {
-            interval
-        } else {
-            calculate_next_timeout(interval, self.retrans[timer as usize], self.rto_max)
+        // T3 uses the path RTO, which the association doubles on expiry and
+        // retains across acknowledgements until a fresh RTT sample arrives.
+        let interval = match timer {
+            Timer::Ack => interval,
+            Timer::T3RTX => interval.min(self.rto_max),
+            _ => calculate_next_timeout(interval, self.retrans[timer as usize], self.rto_max),
         };
 
         let time = now + Duration::from_millis(interval);
@@ -209,6 +211,11 @@ impl RtoManager {
     /// get_rto simply returns the current RTO in msec.
     pub(crate) fn get_rto(&self) -> u64 {
         self.rto
+    }
+
+    /// Retain T3 backoff until an unambiguous RTT sample recomputes the RTO.
+    pub(crate) fn backoff(&mut self) {
+        self.rto = self.rto.saturating_mul(2).min(self.rto_max);
     }
 
     /// reset resets the RTO variables to the initial values.

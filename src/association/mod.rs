@@ -70,6 +70,9 @@ mod association_test;
 #[cfg(test)]
 mod window_ack_test;
 
+#[cfg(test)]
+mod persistent_rto_test;
+
 /// Reasons why an association might be lost
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -4243,6 +4246,10 @@ impl Association {
 
             Timer::T3RTX => {
                 self.stats.inc_t3timeouts();
+
+                // RFC 9260 section 6.3.3 E2 changes the path RTO itself.
+                // Timer cancellation after an ACK must not undo this backoff.
+                self.rto_mgr.backoff();
 
                 // RFC 4960 sec 6.3.3
                 //  E1)  For the destination address for which the timer expires, adjust
