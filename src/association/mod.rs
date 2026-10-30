@@ -39,6 +39,7 @@ use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
+use spurious_recovery::SpuriousRecovery;
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
@@ -61,6 +62,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
 
+mod spurious_recovery;
 pub(crate) mod state;
 pub(crate) mod stats;
 pub(crate) mod stream;
@@ -77,6 +79,9 @@ mod persistent_rto_test;
 
 #[cfg(test)]
 mod duplicate_sack_test;
+
+#[cfg(test)]
+mod spurious_endpoint_test;
 
 /// Reasons why an association might be lost
 #[non_exhaustive]
@@ -302,6 +307,7 @@ pub struct Association {
     rwnd: u32,
     // slow start threshold
     pub(crate) ssthresh: u32,
+    spurious_recovery: SpuriousRecovery,
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
@@ -403,6 +409,7 @@ impl Default for Association {
             rwnd: 0,
             // slow start threshold
             ssthresh: 0,
+            spurious_recovery: SpuriousRecovery::default(),
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
@@ -1452,6 +1459,9 @@ impl Association {
 
     /// set_state atomically sets the state of the Association.
     fn set_state(&mut self, new_state: AssociationState) {
+        if new_state != AssociationState::Established {
+            self.spurious_recovery.invalidate();
+        }
         if new_state != self.state {
             debug!(
                 "[{}] state change: '{}' => '{}'",
@@ -2490,6 +2500,7 @@ impl Association {
             return Ok(vec![]);
         }
 
+        let previous_cumulative = self.cumulative_tsn_ack_point;
         // Process selective ack
         let (bytes_acked_per_stream, htna) = self.process_selective_ack(d, now)?;
 
@@ -2574,10 +2585,29 @@ impl Association {
 
         self.postprocess_sack(state, cum_tsn_ack_point_advanced, now);
 
+        if let Some(threshold) = self.spurious_recovery.sack(
+            previous_cumulative,
+            self.cumulative_tsn_ack_point,
+            &d.duplicate_tsn,
+            self.in_fast_recovery
+                || self.will_retransmit_fast
+                || self.will_send_forward_tsn
+                || self.state() != AssociationState::Established,
+        ) {
+            // Late duplicate proof revalidates only the prior threshold. The
+            // congestion window continues growing through ordinary ACK credit.
+            self.ssthresh = threshold;
+            trace!(
+                "[{}] revalidated ssthresh={} after duplicate proof",
+                self.side, threshold
+            );
+        }
+
         Ok(vec![])
     }
 
     fn handle_reconfig(&mut self, c: &ChunkReconfig) -> Result<Vec<Packet>> {
+        self.spurious_recovery.invalidate();
         trace!("[{}] handle_reconfig", self.side);
 
         let mut pp = vec![];
@@ -3548,8 +3578,18 @@ impl Association {
     ) -> Vec<Bytes> {
         for p in &self.get_data_packets_to_retransmit(now) {
             if let Ok(raw) = p.marshal() {
+                for chunk in &p.chunks {
+                    if let Some(data) = chunk.as_any().downcast_ref::<ChunkPayloadData>() {
+                        if data.abandoned() {
+                            self.spurious_recovery.invalidate();
+                        } else {
+                            self.spurious_recovery.retransmit(data.tsn, data.nsent);
+                        }
+                    }
+                }
                 raw_packets.push(raw);
             } else {
+                self.spurious_recovery.disable();
                 warn!(
                     "[{}] failed to serialize a DATA packet to be retransmitted",
                     self.side
@@ -3581,6 +3621,7 @@ impl Association {
                 if let Ok(raw) = p.marshal() {
                     raw_packets.push(raw);
                 } else {
+                    self.spurious_recovery.disable();
                     warn!("[{}] failed to serialize a DATA packet", self.side);
                 }
             }
@@ -3676,6 +3717,7 @@ impl Association {
         now: Instant,
     ) -> Vec<Bytes> {
         if self.will_retransmit_fast {
+            self.spurious_recovery.invalidate();
             self.will_retransmit_fast = false;
 
             let mut to_fast_retrans: Vec<Box<dyn Chunk + Send + Sync>> = vec![];
@@ -3766,6 +3808,7 @@ impl Association {
             self.will_send_forward_tsn
         );*/
         if self.will_send_forward_tsn {
+            self.spurious_recovery.invalidate();
             self.will_send_forward_tsn = false;
             if sna32gt(
                 self.advanced_peer_tsn_ack_point,
@@ -4181,6 +4224,7 @@ impl Association {
             return Err(Error::ErrResetPacketInStateNotExist);
         }
 
+        self.spurious_recovery.invalidate();
         self.pending_reset_streams.push_back(stream_identifier);
         self.awake_write_loop();
 
@@ -4271,6 +4315,33 @@ impl Association {
 
             Timer::T3RTX => {
                 self.stats.inc_t3timeouts();
+
+                let eligible = self.state() == AssociationState::Established
+                    && !self.in_fast_recovery
+                    && !self.will_retransmit_fast
+                    && !self.will_send_forward_tsn
+                    && self.reconfigs.is_empty()
+                    && self.reconfig_requests.is_empty()
+                    && self.pending_reset_streams.is_empty()
+                    && self.inflight_queue.sorted.iter().all(|tsn| {
+                        self.inflight_queue.get(*tsn).is_some_and(|chunk| {
+                            chunk.nsent == 1
+                                && !chunk.abandoned()
+                                && (chunk.payload_type == PayloadProtocolIdentifier::Dcep
+                                    || self.streams.get(&chunk.stream_identifier).is_some_and(
+                                        |stream| {
+                                            stream.reliability_type == ReliabilityType::Reliable
+                                        },
+                                    ))
+                        })
+                    });
+                self.spurious_recovery.timeout(
+                    self.cumulative_tsn_ack_point.wrapping_add(1),
+                    self.my_next_tsn.wrapping_sub(1),
+                    self.ssthresh,
+                    self.inflight_queue.len(),
+                    eligible,
+                );
 
                 // RFC 9260 section 6.3.3 E2 changes the path RTO itself.
                 // Timer cancellation after an ACK must not undo this backoff.
