@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::config::{RTO_INITIAL, RTO_MAX, RTO_MIN};
 
 pub(crate) const ACK_INTERVAL: u64 = 200;
-const TIMER_COUNT: usize = 6;
+const TIMER_COUNT: usize = 8;
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub(crate) enum Timer {
@@ -14,6 +14,10 @@ pub(crate) enum Timer {
     T3RTX = 3,
     Reconfig = 4,
     Ack = 5,
+    /// Tail loss probe timeout (RFC 8985 section 7).
+    Probe = 6,
+    /// RACK reordering window for early retransmission (RFC 8985 section 6).
+    Rack = 7,
 }
 
 impl Timer {
@@ -24,6 +28,8 @@ impl Timer {
         Timer::T3RTX,
         Timer::Reconfig,
         Timer::Ack,
+        Timer::Probe,
+        Timer::Rack,
     ];
 }
 
@@ -66,6 +72,8 @@ impl TimerTable {
                 max_data_retransmits, //T3RTX
                 max_init_retransmits, //Reconfig
                 None,                 //Ack (unlimited)
+                None,                 //Probe (unlimited)
+                None,                 //Rack (unlimited)
             ],
             rto_max,
             ..Default::default()
@@ -88,7 +96,7 @@ impl TimerTable {
         // T3 uses the path RTO, which the association doubles on expiry and
         // retains across acknowledgements until a fresh RTT sample arrives.
         let interval = match timer {
-            Timer::Ack => interval,
+            Timer::Ack | Timer::Probe | Timer::Rack => interval,
             Timer::T3RTX => interval.min(self.rto_max),
             _ => calculate_next_timeout(interval, self.retrans[timer as usize], self.rto_max),
         };
@@ -149,6 +157,9 @@ const RTO_BASE: u64 = 8;
 #[derive(Debug)]
 pub(crate) struct RtoManager {
     pub(crate) srtt: u64,
+    /// Whether `srtt` holds a measurement. Millisecond samples on a
+    /// sub-millisecond path leave `srtt` at zero after a valid sample.
+    pub(crate) measured: bool,
     pub(crate) rttvar: f64,
     pub(crate) rto: u64,
     pub(crate) no_update: bool,
@@ -161,6 +172,7 @@ impl Default for RtoManager {
     fn default() -> Self {
         RtoManager {
             srtt: 0,
+            measured: false,
             rttvar: 0.0,
             rto: RTO_INITIAL,
             no_update: false,
@@ -176,6 +188,7 @@ impl RtoManager {
     pub(crate) fn new(rto_initial: u64, rto_min: u64, rto_max: u64) -> Self {
         RtoManager {
             srtt: 0,
+            measured: false,
             rttvar: 0.0,
             rto: rto_initial,
             no_update: false,
@@ -204,6 +217,7 @@ impl RtoManager {
         }
 
         self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(self.rto_min, self.rto_max);
+        self.measured = true;
 
         self.srtt
     }
@@ -225,6 +239,7 @@ impl RtoManager {
         }
 
         self.srtt = 0;
+        self.measured = false;
         self.rttvar = 0.0;
         self.rto = self.rto_initial;
     }

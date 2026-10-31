@@ -39,6 +39,7 @@ use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
+use loss_recovery::{Delivered, Rack};
 use spurious_recovery::SpuriousRecovery;
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
@@ -62,6 +63,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
 
+mod loss_recovery;
 mod spurious_recovery;
 pub(crate) mod state;
 pub(crate) mod stats;
@@ -82,6 +84,9 @@ mod duplicate_sack_test;
 
 #[cfg(test)]
 mod spurious_endpoint_test;
+
+#[cfg(test)]
+mod loss_recovery_test;
 
 /// Reasons why an association might be lost
 #[non_exhaustive]
@@ -312,6 +317,19 @@ pub struct Association {
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
 
+    // Tail loss probe (RFC 8985 section 7)
+    /// TSN chosen by an expired probe timer, sent by the next transmit poll.
+    will_send_probe: Option<u32>,
+    /// TSN retransmitted by the outstanding probe until it is acknowledged.
+    loss_probe: Option<u32>,
+    /// Set when an acknowledgement shows that a probe repaired a loss.
+    probe_repaired_loss: bool,
+    /// TSNs retransmitted by a probe or RACK whose duplicate reports that
+    /// retransmission explains.
+    explained_duplicates: VecDeque<u32>,
+    /// RACK delivery state (RFC 8985 section 6)
+    rack: Rack,
+
     // Chunks stored for retransmission
     stored_init: Option<ChunkInit>,
     stored_cookie_echo: Option<ChunkCookieEcho>,
@@ -413,6 +431,12 @@ impl Default for Association {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+
+            will_send_probe: None,
+            loss_probe: None,
+            probe_repaired_loss: false,
+            explained_duplicates: VecDeque::default(),
+            rack: Rack::default(),
 
             // Chunks stored for retransmission
             stored_init: None,
@@ -790,6 +814,12 @@ impl Association {
 
             if timer == Timer::Ack {
                 self.on_ack_timeout();
+            } else if timer == Timer::Probe {
+                self.timers.stop(timer);
+                self.on_probe_timeout();
+            } else if timer == Timer::Rack {
+                self.timers.stop(timer);
+                self.on_rack_timeout(now);
             } else if failure {
                 self.on_retransmission_failure(timer);
             } else {
@@ -2522,6 +2552,7 @@ impl Association {
             cum_tsn_ack_point_advanced = true;
             self.on_cumulative_tsn_ack_point_advanced(total_bytes_acked, now);
         }
+        self.respond_to_probe_repaired_loss();
 
         for (si, n_bytes_acked) in &bytes_acked_per_stream {
             if let Some(s) = self.streams.get_mut(si) {
@@ -2547,7 +2578,12 @@ impl Association {
             self.rwnd = d.advertised_receiver_window_credit - bytes_outstanding;
         }
 
-        self.process_fast_retransmission(d.cumulative_tsn_ack, htna, cum_tsn_ack_point_advanced)?;
+        self.process_fast_retransmission(
+            d.cumulative_tsn_ack,
+            htna,
+            cum_tsn_ack_point_advanced,
+            now,
+        )?;
 
         if self.use_forward_tsn {
             // RFC 3758 Sec 3.5 C1
@@ -2587,10 +2623,18 @@ impl Association {
 
         self.postprocess_sack(state, cum_tsn_ack_point_advanced, now);
 
+        // RFC 8985 section 7.2 restarts the probe timer on cumulative progress.
+        if cum_tsn_ack_point_advanced {
+            self.arm_loss_probe(now);
+        } else {
+            self.cancel_loss_probe_if_ineligible();
+        }
+
+        let duplicates = self.unexplained_duplicates(&d.duplicate_tsn);
         if let Some(threshold) = self.spurious_recovery.sack(
             previous_cumulative,
             self.cumulative_tsn_ack_point,
-            &d.duplicate_tsn,
+            &duplicates,
             self.in_fast_recovery
                 || self.will_retransmit_fast
                 || self.will_send_forward_tsn
@@ -3036,6 +3080,7 @@ impl Association {
                     }
 
                     let n_bytes_acked = c.user_data.len() as i64;
+                    self.on_chunk_delivered(Delivered::of(&c), &d.duplicate_tsn, now);
 
                     // Sum the number of bytes acknowledged per stream
                     if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
@@ -3100,8 +3145,10 @@ impl Association {
                     0
                 };
 
+                let mut delivered = None;
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     if !is_acked {
+                        delivered = Some(Delivered::of(c));
                         // Sum the number of bytes acknowledged per stream
                         if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
                             *amount += n_bytes_acked;
@@ -3134,6 +3181,9 @@ impl Association {
                     }
                 } else {
                     return Err(Error::ErrTsnRequestNotExist);
+                }
+                if let Some(delivered) = delivered {
+                    self.on_chunk_delivered(delivered, &d.duplicate_tsn, now);
                 }
             }
         }
@@ -3219,6 +3269,7 @@ impl Association {
         cum_tsn_ack_point: u32,
         htna: u32,
         cum_tsn_ack_point_advanced: bool,
+        now: Instant,
     ) -> Result<()> {
         // HTNA algorithm - RFC 4960 Sec 7.2.4
         // Increment missIndicator of each chunks that the SACK reported missing
@@ -3274,6 +3325,9 @@ impl Association {
         if self.in_fast_recovery && cum_tsn_ack_point_advanced {
             self.will_retransmit_fast = true;
         }
+
+        // Small flights cannot accumulate three miss indications.
+        self.rack_rearm(now);
 
         Ok(())
     }
@@ -3494,6 +3548,7 @@ impl Association {
                 // this same poll so DATA and RE-CONFIG can leave together.
                 raw_packets = self.gather_outbound_control_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
+                raw_packets = self.gather_outbound_probe_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)
@@ -3503,6 +3558,7 @@ impl Association {
             | AssociationState::ShutdownReceived => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
+                raw_packets = self.gather_outbound_probe_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 self.gather_outbound_shutdown_packets(raw_packets, now)
             }
@@ -3635,6 +3691,11 @@ impl Association {
                     warn!("[{}] failed to serialize a DATA packet", self.side);
                 }
             }
+
+            // RFC 8985 section 7.2 restarts the probe timer after new data,
+            // which also takes the place of a probe that has not left yet.
+            self.will_send_probe = None;
+            self.arm_loss_probe(now);
         }
 
         if self.will_retransmit_reconfig {
@@ -3730,7 +3791,7 @@ impl Association {
             self.spurious_recovery.invalidate();
             self.will_retransmit_fast = false;
 
-            let mut to_fast_retrans: Vec<Box<dyn Chunk + Send + Sync>> = vec![];
+            let mut to_fast_retrans: Vec<ChunkPayloadData> = vec![];
             let mut fast_retrans_size = COMMON_HEADER_SIZE;
 
             let mut i = 0;
@@ -3760,6 +3821,7 @@ impl Association {
                     fast_retrans_size += data_chunk_size;
                     self.stats.inc_fast_retrans();
                     c.nsent += 1;
+                    c.last_sent = Some(now);
                 } else {
                     break; // end of pending data
                 }
@@ -3772,7 +3834,7 @@ impl Association {
                         self.side,
                         &self.streams,
                     );
-                    to_fast_retrans.push(Box::new(c.clone()));
+                    to_fast_retrans.push(c.clone());
                     trace!(
                         "[{}] fast-retransmit: tsn={} sent={} htna={}",
                         self.side, c.tsn, c.nsent, self.fast_recover_exit_point
@@ -3782,7 +3844,16 @@ impl Association {
             }
 
             if !to_fast_retrans.is_empty() {
-                if let Ok(raw) = self.create_packet(to_fast_retrans).marshal() {
+                // A repaired hole would otherwise wait for the peer's delayed
+                // SACK, which can outlast T3-rtx on long paths (RFC 7053).
+                if let Some(last) = to_fast_retrans.last_mut() {
+                    last.immediate_sack = true;
+                }
+                let chunks = to_fast_retrans
+                    .into_iter()
+                    .map(|c| Box::new(c) as Box<dyn Chunk + Send + Sync>)
+                    .collect();
+                if let Ok(raw) = self.create_packet(chunks).marshal() {
                     raw_packets.push(raw);
                 } else {
                     warn!(
@@ -3921,6 +3992,7 @@ impl Association {
                 bytes_to_send += c.user_data.len();
 
                 c.nsent += 1;
+                c.last_sent = Some(now);
             } else {
                 break; // end of pending data
             }
@@ -4023,7 +4095,8 @@ impl Association {
         //
         // RFC 7053 section 4.1 also lets the sender request one for the last
         // DATA it has for a while. With the queue drained, a delayed SACK
-        // only postpones the acknowledgement that clears the flight.
+        // only postpones the acknowledgement that clears the flight, and the
+        // tail loss probe timer assumes the peer acknowledges at once.
         if remaining_window < self.max_payload_size as usize || queue_drained {
             if let Some(last) = chunks.last_mut() {
                 last.immediate_sack = true;
@@ -4206,6 +4279,7 @@ impl Association {
             c.tsn = self.generate_next_tsn();
 
             c.since = Some(now); // use to calculate RTT and also for maxPacketLifeTime
+            c.last_sent = Some(now);
             c.nsent = 1; // being sent for the first time
 
             Association::check_partial_reliability_status(
@@ -4422,6 +4496,7 @@ impl Association {
                     self.side, n_rtos, self.cwnd, self.ssthresh
                 );
 
+                self.reset_loss_recovery_on_t3();
                 self.inflight_queue.mark_all_to_retrasmit();
                 self.awake_write_loop();
             }
