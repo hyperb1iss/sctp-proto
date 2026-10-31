@@ -131,7 +131,8 @@ fn gap_duplicates_preserve_order_and_are_reported_once() {
     assert_eq!(read(&mut receiver), Some(b"first".to_vec()));
     assert_eq!(read(&mut receiver), Some(b"second".to_vec()));
     assert!(read(&mut receiver).is_none());
-    let ack = delayed_sack(&mut receiver, now);
+    // DATA that closes the last gap is acknowledged without delay.
+    let ack = sack(&mut receiver, now);
     assert_eq!(ack.cumulative_tsn_ack, 11);
     assert!(ack.gap_ack_blocks.is_empty());
     assert!(ack.duplicate_tsn.is_empty());
@@ -366,4 +367,29 @@ fn lowest_gap_blocks_take_priority_over_duplicate_reports() {
         assert!(read(&mut receiver).is_none());
         assert!(receiver.payload_queue.pop_duplicates().is_empty());
     }
+}
+
+#[test]
+fn gap_closing_data_is_acknowledged_at_once() {
+    let mut sender = established(10, 65536);
+    let mut receiver = established(10, 65536);
+    let now = Instant::now();
+    let first = send(&mut sender, b"first", now);
+    let second = send(&mut sender, b"second", now);
+    let third = send(&mut sender, b"third", now);
+    receive(&mut receiver, &second, now);
+    assert_eq!(sack(&mut receiver, now).gap_ack_blocks.len(), 1);
+
+    receive(&mut receiver, &first, now);
+    let ack = sack(&mut receiver, now);
+    assert_eq!(ack.cumulative_tsn_ack, 11);
+    assert!(ack.gap_ack_blocks.is_empty());
+
+    // In-order DATA after the gap closed returns to delayed acknowledgement.
+    receive(&mut receiver, &third, now);
+    let ack = delayed_sack(&mut receiver, now);
+    assert_eq!(ack.cumulative_tsn_ack, 12);
+    assert_eq!(read(&mut receiver), Some(b"first".to_vec()));
+    assert_eq!(read(&mut receiver), Some(b"second".to_vec()));
+    assert_eq!(read(&mut receiver), Some(b"third".to_vec()));
 }

@@ -2389,8 +2389,10 @@ impl Association {
             // RFC 9260 section 6.2 requires an immediate SACK for duplicate DATA.
             let max_reports = self.sack_report_capacity();
             self.payload_queue.record_duplicate(d.tsn, max_reports);
-            return self.handle_peer_last_tsn_and_acknowledgement(true);
+            return self.handle_peer_last_tsn_and_acknowledgement(true, false);
         }
+        // Chunks above a missing TSN wait in the payload queue.
+        let gap_was_open = !self.payload_queue.is_empty();
         let mut stream_handle_data = false;
         let mut defer_stream_data = false;
         if self.data_is_above_pending_reset(d) {
@@ -2462,7 +2464,7 @@ impl Association {
             self.apply_deferred_forward_tsns(d.stream_identifier);
         }
 
-        self.handle_peer_last_tsn_and_acknowledgement(immediate_sack)
+        self.handle_peer_last_tsn_and_acknowledgement(immediate_sack, gap_was_open)
     }
 
     fn handle_sack(&mut self, d: &ChunkSelectiveAck, now: Instant) -> Result<Vec<Packet>> {
@@ -2699,7 +2701,7 @@ impl Association {
 
         let mut reply = vec![];
         self.reevaluate_pending_reset_requests(&mut reply)?;
-        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false)?);
+        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false, false)?);
         Ok(reply)
     }
 
@@ -2760,7 +2762,7 @@ impl Association {
 
         let mut reply = vec![];
         self.reevaluate_pending_reset_requests(&mut reply)?;
-        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false)?);
+        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false, false)?);
         Ok(reply)
     }
 
@@ -2828,6 +2830,7 @@ impl Association {
     fn handle_peer_last_tsn_and_acknowledgement(
         &mut self,
         sack_immediately: bool,
+        gap_was_open: bool,
     ) -> Result<Vec<Packet>> {
         let mut reply = vec![];
 
@@ -2870,9 +2873,15 @@ impl Association {
             );
         }
 
+        // Acknowledge DATA that closes the last gap at once, as TCP does
+        // (RFC 5681 section 4.2). The sender's loss recovery and reordering
+        // checks would otherwise wait out the delayed SACK timer.
+        let gap_closed = gap_was_open && !has_packet_loss;
+
         if (self.ack_state != AckState::Immediate
             && !sack_immediately
             && !has_packet_loss
+            && !gap_closed
             && self.ack_mode == AckMode::Normal)
             || self.ack_mode == AckMode::AlwaysDelay
         {
