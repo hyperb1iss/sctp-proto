@@ -59,6 +59,10 @@ pub struct TransportConfig {
     /// Maximum retransmission timeout in milliseconds.
     /// Default: 60000
     rto_max_ms: u64,
+
+    /// Whether associations queue a delivery report for every acknowledged
+    /// DATA chunk. Default: false
+    data_delivery_reports: bool,
 }
 
 impl Default for TransportConfig {
@@ -74,6 +78,7 @@ impl Default for TransportConfig {
             rto_initial_ms: RTO_INITIAL,
             rto_min_ms: RTO_MIN,
             rto_max_ms: RTO_MAX,
+            data_delivery_reports: false,
         }
     }
 }
@@ -178,6 +183,20 @@ impl TransportConfig {
 
     pub(crate) fn rto_max_ms(&self) -> u64 {
         self.rto_max_ms
+    }
+
+    /// Queue a [`DataDelivery`](crate::DataDelivery) report for every
+    /// acknowledged DATA chunk, drained with
+    /// [`Association::poll_data_delivery`](crate::Association::poll_data_delivery).
+    /// Enable this only when the caller drains the reports; they feed
+    /// congestion control that shares the path with SCTP.
+    pub fn with_data_delivery_reports(mut self, value: bool) -> Self {
+        self.data_delivery_reports = value;
+        self
+    }
+
+    pub(crate) fn data_delivery_reports(&self) -> bool {
+        self.data_delivery_reports
     }
 }
 

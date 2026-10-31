@@ -33,6 +33,31 @@ const FAST_RETRANSMIT_THRESHOLD: usize = 3;
 /// Recent TSNs whose duplicate reports our own retransmissions explain.
 const EXPLAINED_HISTORY: usize = 16;
 
+/// Delivery outcome of one DATA chunk, reported when it is first
+/// acknowledged. Enable with
+/// [`TransportConfig::with_data_delivery_reports`](crate::TransportConfig::with_data_delivery_reports)
+/// and drain with [`Association::poll_data_delivery`].
+///
+/// Congestion controllers outside SCTP can treat each transmission as a
+/// packet: `lost_transmissions` of them did not reach the peer and the last
+/// one did. The first lost transmission left at `first_sent`; later lost
+/// retransmissions left between `first_sent` and `last_sent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataDelivery {
+    /// When the chunk was first transmitted.
+    pub first_sent: Instant,
+    /// When the chunk was last transmitted.
+    pub last_sent: Instant,
+    /// When the acknowledgement arrived.
+    pub acked_at: Instant,
+    /// User data bytes carried by the chunk.
+    pub bytes: usize,
+    /// Transmissions that did not reach the peer. Every retransmission
+    /// counts as one loss, except one proven unnecessary by a duplicate
+    /// report in the acknowledging SACK.
+    pub lost_transmissions: u32,
+}
+
 /// RFC 8985 section 6 state, restricted to unambiguous deliveries.
 #[derive(Debug, Default)]
 pub(super) struct Rack {
@@ -48,15 +73,19 @@ pub(super) struct Rack {
 pub(super) struct Delivered {
     pub(super) tsn: u32,
     pub(super) nsent: u32,
+    pub(super) bytes: usize,
+    pub(super) since: Option<Instant>,
     pub(super) last_sent: Option<Instant>,
     pub(super) abandoned: bool,
 }
 
 impl Delivered {
-    pub(super) fn of(c: &ChunkPayloadData) -> Self {
+    pub(super) fn of(c: &ChunkPayloadData, bytes: usize) -> Self {
         Delivered {
             tsn: c.tsn,
             nsent: c.nsent,
+            bytes,
+            since: c.since,
             last_sent: c.last_sent,
             abandoned: c.abandoned(),
         }
@@ -69,18 +98,44 @@ fn sent_after(a: (Instant, u32), b: (Instant, u32)) -> bool {
 }
 
 impl Association {
+    /// Next delivery report, oldest first. Always `None` unless
+    /// [`TransportConfig::with_data_delivery_reports`](crate::TransportConfig::with_data_delivery_reports)
+    /// enabled them.
+    pub fn poll_data_delivery(&mut self) -> Option<DataDelivery> {
+        self.delivery_reports.as_mut()?.pop_front()
+    }
+
     /// Account for a chunk acknowledged for the first time.
     pub(super) fn on_chunk_delivered(&mut self, d: Delivered, duplicates: &[u32], now: Instant) {
         self.rack_on_delivery(&d, now);
 
+        let duplicated = duplicates.contains(&d.tsn);
         if self.loss_probe == Some(d.tsn) {
             self.loss_probe = None;
             // A probe whose original also arrived makes the peer report a
             // duplicate. Without one, the probe repaired a lost tail.
-            if !duplicates.contains(&d.tsn) && d.nsent == 2 && !d.abandoned {
+            if !duplicated && d.nsent == 2 && !d.abandoned {
                 self.probe_repaired_loss = true;
             }
         }
+
+        if d.abandoned {
+            return;
+        }
+        let (Some(reports), Some(first_sent), Some(last_sent)) =
+            (self.delivery_reports.as_mut(), d.since, d.last_sent)
+        else {
+            return;
+        };
+        let retransmissions = d.nsent.saturating_sub(1);
+        let proven_unnecessary = u32::from(duplicated && retransmissions > 0);
+        reports.push_back(DataDelivery {
+            first_sent,
+            last_sent,
+            acked_at: now,
+            bytes: d.bytes,
+            lost_transmissions: retransmissions - proven_unnecessary,
+        });
     }
 
     /// RFC 8985 section 6.2 steps 1 and 2: track the latest sent delivery.

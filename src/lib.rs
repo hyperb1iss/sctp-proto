@@ -63,6 +63,7 @@ use std::time::Instant;
 mod association;
 pub use crate::association::Association;
 pub use crate::association::AssociationError;
+pub use crate::association::DataDelivery;
 pub use crate::association::Event;
 pub use crate::association::stats::AssociationStats;
 pub use crate::association::stream::{

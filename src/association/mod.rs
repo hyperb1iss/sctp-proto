@@ -88,6 +88,8 @@ mod spurious_endpoint_test;
 #[cfg(test)]
 mod loss_recovery_test;
 
+pub use loss_recovery::DataDelivery;
+
 /// Reasons why an association might be lost
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -329,6 +331,8 @@ pub struct Association {
     explained_duplicates: VecDeque<u32>,
     /// RACK delivery state (RFC 8985 section 6)
     rack: Rack,
+    /// Delivery outcomes awaiting `poll_data_delivery`, when enabled.
+    delivery_reports: Option<VecDeque<DataDelivery>>,
 
     // Chunks stored for retransmission
     stored_init: Option<ChunkInit>,
@@ -437,6 +441,7 @@ impl Default for Association {
             probe_repaired_loss: false,
             explained_duplicates: VecDeque::default(),
             rack: Rack::default(),
+            delivery_reports: None,
 
             // Chunks stored for retransmission
             stored_init: None,
@@ -504,6 +509,7 @@ impl Association {
             cwnd,
             remote_addr,
             local_ip,
+            delivery_reports: config.data_delivery_reports().then(VecDeque::new),
 
             my_verification_tag: verification_tag,
             my_next_tsn: initial_tsn,
@@ -3080,7 +3086,11 @@ impl Association {
                     }
 
                     let n_bytes_acked = c.user_data.len() as i64;
-                    self.on_chunk_delivered(Delivered::of(&c), &d.duplicate_tsn, now);
+                    self.on_chunk_delivered(
+                        Delivered::of(&c, n_bytes_acked as usize),
+                        &d.duplicate_tsn,
+                        now,
+                    );
 
                     // Sum the number of bytes acknowledged per stream
                     if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
@@ -3148,7 +3158,7 @@ impl Association {
                 let mut delivered = None;
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     if !is_acked {
-                        delivered = Some(Delivered::of(c));
+                        delivered = Some(Delivered::of(c, n_bytes_acked as usize));
                         // Sum the number of bytes acknowledged per stream
                         if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
                             *amount += n_bytes_acked;

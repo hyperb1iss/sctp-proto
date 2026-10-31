@@ -7,7 +7,8 @@ const SRTT: Duration = Duration::from_millis(20);
 fn established() -> Association {
     let config = TransportConfig::default()
         .with_rto_initial_ms(500)
-        .with_rto_min_ms(400);
+        .with_rto_min_ms(400)
+        .with_data_delivery_reports(true);
     let mut association = Association::new_common(
         Arc::new(config),
         PAYLOAD_SIZE,
@@ -111,6 +112,9 @@ impl Pair {
         pair.sent = [vec![], vec![]];
         pair.sack_log.clear();
         pair.received = [vec![], vec![]];
+        for peer in &mut pair.peers {
+            while peer.poll_data_delivery().is_some() {}
+        }
         pair
     }
 
@@ -215,6 +219,10 @@ impl Pair {
         self.peers[0].my_next_tsn
     }
 
+    fn deliveries(&mut self) -> Vec<DataDelivery> {
+        core::iter::from_fn(|| self.peers[0].poll_data_delivery()).collect()
+    }
+
     fn stats(&self) -> AssociationStats {
         self.peers[0].stats()
     }
@@ -269,6 +277,13 @@ fn probe_recovers_a_lost_single_chunk_after_two_srtt() {
     assert_eq!(stats.get_num_t3timeouts(), 0);
     assert_eq!(pair.peers[0].timers.get(Timer::Probe), None);
     assert_eq!(pair.peers[0].timers.get(Timer::T3RTX), None);
+
+    let deliveries = pair.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].lost_transmissions, 1);
+    assert_eq!(deliveries[0].first_sent, start);
+    assert_eq!(deliveries[0].last_sent, start + 2 * SRTT);
+    assert_eq!(deliveries[0].bytes, 300);
 }
 
 #[test]
@@ -344,6 +359,9 @@ fn spurious_probe_after_a_lost_sack_keeps_the_window() {
         "an explained duplicate must not disable spurious timeout detection"
     );
     assert_eq!(pair.received[1].len(), 1, "delivered exactly once");
+    let deliveries = pair.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].lost_transmissions, 0);
 }
 
 #[test]
@@ -479,6 +497,14 @@ fn early_retransmit_recovers_a_hole_with_two_later_chunks() {
     assert_eq!(stats.get_num_fast_retrans(), 1);
     assert_eq!(stats.get_num_t3timeouts(), 0);
     assert_eq!(stats.get_num_loss_probes(), 0);
+    let deliveries = pair.deliveries();
+    assert_eq!(
+        deliveries
+            .iter()
+            .map(|delivery| delivery.lost_transmissions)
+            .collect::<Vec<_>>(),
+        [0, 0, 1]
+    );
 }
 
 #[test]
@@ -499,6 +525,11 @@ fn early_retransmit_waits_out_reordering() {
     assert_eq!(stats.get_num_loss_probes(), 0);
     assert_eq!(stats.get_num_t3timeouts(), 0);
     assert_eq!(pair.peers[0].timers.get(Timer::Rack), None);
+    assert!(
+        pair.deliveries()
+            .iter()
+            .all(|delivery| delivery.lost_transmissions == 0)
+    );
 }
 
 #[test]
@@ -617,6 +648,25 @@ fn clean_paths_never_retransmit() {
             assert_eq!(stats.get_num_early_retrans(), 0, "one_way={one_way}ms");
             assert_eq!(stats.get_num_fast_retrans(), 0, "one_way={one_way}ms");
             assert_eq!(stats.get_num_t3timeouts(), 0, "one_way={one_way}ms");
+            assert!(
+                core::iter::from_fn(|| peer.poll_data_delivery())
+                    .all(|d| d.lost_transmissions == 0)
+            );
         }
     }
+}
+
+#[test]
+fn delivery_reports_are_opt_in() {
+    let mut association = Association::new_common(
+        Arc::new(TransportConfig::default()),
+        PAYLOAD_SIZE,
+        SocketAddr::from_str("127.0.0.1:5000").unwrap(),
+        None,
+        Side::Client,
+        1,
+        1,
+    );
+    assert!(association.delivery_reports.is_none());
+    assert_eq!(association.poll_data_delivery(), None);
 }
