@@ -27,15 +27,27 @@ fn send(sender: &mut Association, bytes: &[u8], now: Instant) -> Bytes {
     assert_eq!(packets.len(), 1);
     let packet = Packet::unmarshal(&packets[0]).unwrap();
     assert_eq!(packet.chunks.len(), 1);
-    let data = packet.chunks[0]
+    let mut data = packet.chunks[0]
         .as_any()
         .downcast_ref::<ChunkPayloadData>()
+        .unwrap()
+        .clone();
+    // The sender requests an immediate SACK for the last DATA it has queued.
+    // Clear the I-bit so these tests exercise the receiver's own rules.
+    data.immediate_sack = false;
+    let packet = sender
+        .create_packet(vec![Box::new(data)])
+        .marshal()
         .unwrap();
     assert!(
-        !data.immediate_sack,
+        !Packet::unmarshal(&packet).unwrap().chunks[0]
+            .as_any()
+            .downcast_ref::<ChunkPayloadData>()
+            .unwrap()
+            .immediate_sack,
         "the receiver must not rely on the I-bit"
     );
-    packets[0].clone()
+    packet
 }
 
 fn receive(receiver: &mut Association, packet: &Bytes, now: Instant) {

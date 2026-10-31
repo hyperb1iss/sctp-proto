@@ -3626,7 +3626,8 @@ impl Association {
             let remaining_window = (self.cwnd as usize)
                 .saturating_sub(self.inflight_queue.get_num_bytes())
                 .min(self.rwnd as usize);
-            for p in &self.bundle_data_chunks_into_packets(chunks, remaining_window) {
+            let drained = self.pending_queue.is_empty();
+            for p in &self.bundle_data_chunks_into_packets(chunks, remaining_window, drained) {
                 if let Ok(raw) = p.marshal() {
                     raw_packets.push(raw);
                 } else {
@@ -3943,7 +3944,11 @@ impl Association {
             i += 1;
         }
 
-        self.bundle_data_chunks_into_packets(chunks, (awnd as usize).saturating_sub(bytes_to_send))
+        self.bundle_data_chunks_into_packets(
+            chunks,
+            (awnd as usize).saturating_sub(bytes_to_send),
+            false,
+        )
     }
 
     /// pop_pending_data_chunks_to_send pops chunks from the pending queues as many as
@@ -4009,12 +4014,17 @@ impl Association {
         &self,
         mut chunks: Vec<ChunkPayloadData>,
         remaining_window: usize,
+        queue_drained: bool,
     ) -> Vec<Packet> {
         // RFC 9260 section 6.1 permits requesting an immediate SACK when a
         // transmission fills the congestion or receiver window. If another
         // full fragment cannot fit, a delayed ACK can leave the sender idle,
         // including when the next message has not been queued yet.
-        if remaining_window < self.max_payload_size as usize {
+        //
+        // RFC 7053 section 4.1 also lets the sender request one for the last
+        // DATA it has for a while. With the queue drained, a delayed SACK
+        // only postpones the acknowledgement that clears the flight.
+        if remaining_window < self.max_payload_size as usize || queue_drained {
             if let Some(last) = chunks.last_mut() {
                 last.immediate_sack = true;
             }

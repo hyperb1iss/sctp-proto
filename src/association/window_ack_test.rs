@@ -70,7 +70,10 @@ fn recovery_flight_progresses_without_delayed_ack_waits() {
     let first = vec![1; 449];
     write(&mut sender, &first);
     let lost = outbound(&mut sender, start);
-    assert!(!data_chunks(&lost)[0].immediate_sack);
+    assert!(
+        data_chunks(&lost)[0].immediate_sack,
+        "the last DATA before the queue drains requests an immediate SACK"
+    );
     assert!(sender.pending_queue.is_empty());
 
     let timeout = sender.poll_timeout().unwrap();
@@ -123,14 +126,24 @@ fn recovery_flight_progresses_without_delayed_ack_waits() {
 }
 
 #[test]
-fn uncongested_single_packet_keeps_delayed_ack_timer() {
+fn unflagged_data_keeps_delayed_ack_timer() {
     let mut sender = established();
     let mut receiver = established();
     let now = Instant::now();
-    write(&mut sender, &[3; 449]);
+    write(&mut sender, &vec![3; 2 * PAYLOAD_SIZE as usize + 449]);
     let packets = outbound(&mut sender, now);
-    assert!(!data_chunks(&packets)[0].immediate_sack);
-    deliver(&mut receiver, &packets, now);
+    let chunks = data_chunks(&packets);
+    assert_eq!(chunks.len(), 3);
+    assert!(!chunks[0].immediate_sack);
+    assert!(!chunks[1].immediate_sack);
+    assert!(chunks[2].immediate_sack);
+
+    // A packet that leaves more queued DATA behind keeps the delayed ACK.
+    let first = packets
+        .iter()
+        .find(|packet| data_chunks(core::slice::from_ref(*packet))[0].tsn == chunks[0].tsn)
+        .unwrap();
+    deliver(&mut receiver, core::slice::from_ref(first), now);
     assert!(outbound(&mut receiver, now).is_empty());
     let deadline = receiver.poll_timeout().unwrap();
     assert_eq!(deadline - now, Duration::from_millis(200));
@@ -141,15 +154,32 @@ fn uncongested_single_packet_keeps_delayed_ack_timer() {
 }
 
 #[test]
-fn new_data_requests_ack_only_when_a_full_fragment_will_not_fit() {
-    for (cwnd, rwnd, immediate) in [
-        (1090, 10000, true),
-        (10000, 1090, true),
-        (449 + PAYLOAD_SIZE - 1, 10000, true),
-        (10000, 449 + PAYLOAD_SIZE - 1, true),
-        (449 + PAYLOAD_SIZE, 10000, false),
-        (10000, 449 + PAYLOAD_SIZE, false),
-        (10000, 10000, false),
+fn drained_single_packet_is_acknowledged_at_once() {
+    let mut sender = established();
+    let mut receiver = established();
+    let now = Instant::now();
+    write(&mut sender, &[3; 449]);
+    let packets = outbound(&mut sender, now);
+    assert!(data_chunks(&packets)[0].immediate_sack);
+    deliver(&mut receiver, &packets, now);
+    assert!(
+        !outbound(&mut receiver, now).is_empty(),
+        "the peer must not hold the only outstanding DATA for 200ms"
+    );
+}
+
+#[test]
+fn new_data_bursts_end_with_an_ack_request() {
+    // A burst ends either because a full fragment no longer fits the window
+    // or because the queue drained. Both request an immediate SACK.
+    for (cwnd, rwnd) in [
+        (1090, 10000),
+        (10000, 1090),
+        (449 + PAYLOAD_SIZE - 1, 10000),
+        (10000, 449 + PAYLOAD_SIZE - 1),
+        (449 + PAYLOAD_SIZE, 10000),
+        (10000, 449 + PAYLOAD_SIZE),
+        (10000, 10000),
     ] {
         let mut sender = established();
         sender.cwnd = cwnd;
@@ -157,10 +187,7 @@ fn new_data_requests_ack_only_when_a_full_fragment_will_not_fit() {
         write(&mut sender, &[4; 449]);
         let chunks = data_chunks(&outbound(&mut sender, Instant::now()));
         assert_eq!(chunks.len(), 1);
-        assert_eq!(
-            chunks[0].immediate_sack, immediate,
-            "cwnd={cwnd}, rwnd={rwnd}"
-        );
+        assert!(chunks[0].immediate_sack, "cwnd={cwnd}, rwnd={rwnd}");
         assert_eq!(sender.cwnd, cwnd);
         assert_eq!(sender.rwnd, rwnd - 449);
         assert!(
