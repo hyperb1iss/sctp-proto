@@ -264,9 +264,22 @@ fn probe_recovers_a_lost_single_chunk_after_two_srtt() {
     assert_eq!(pair.received[1], [(start + 2 * SRTT + ONE_WAY, message)]);
     pair.run(ONE_WAY.as_millis() as u64);
     assert!(pair.peers[0].inflight_queue.is_empty());
+    assert_eq!(pair.peers[0].timers.get(Timer::T3RTX), None);
 
-    // An acknowledgement without a duplicate report proves a repaired loss:
-    // the window halves to its fast retransmit floor instead of 1 MTU.
+    // The acknowledgement carries no duplicate report, but the original's
+    // SACK could still be ahead of the probe's. A duplicate would follow by
+    // the probe's lead over the original, so the verdict waits that long.
+    let acked = pair.now;
+    let verdict = acked + 2 * SRTT + SRTT / 4 + loss_recovery::PTO_MIN;
+    assert_eq!(pair.peers[0].timers.get(Timer::Probe), Some(verdict));
+    assert_eq!(pair.peers[0].ssthresh, ssthresh);
+    assert!(pair.deliveries().is_empty());
+    pair.run((verdict - acked).as_millis() as u64 - 1);
+    assert_eq!(pair.peers[0].ssthresh, ssthresh);
+    pair.run(1);
+
+    // No duplicate came, so the probe repaired a loss: the window halves to
+    // its fast retransmit floor instead of collapsing to one MTU.
     let mtu = pair.peers[0].mtu;
     assert_eq!(pair.peers[0].ssthresh, (cwnd / 2).max(4 * mtu));
     assert_eq!(pair.peers[0].cwnd, pair.peers[0].ssthresh);
@@ -362,6 +375,53 @@ fn spurious_probe_after_a_lost_sack_keeps_the_window() {
     let deliveries = pair.deliveries();
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].lost_transmissions, 0);
+}
+
+#[test]
+fn probe_after_a_delay_increase_waits_for_its_duplicate() {
+    let mut pair = Pair::warmed_up();
+    let cwnd = pair.peers[0].cwnd;
+    let ssthresh = pair.peers[0].ssthresh;
+    let tsn = pair.next_tsn();
+    pair.one_way = Duration::from_millis(150);
+    let start = pair.now;
+    pair.write(0, &[21; 200]);
+    pair.run(2 * SRTT.as_millis() as u64);
+    assert_eq!(
+        pair.transmissions_of(tsn).len(),
+        2,
+        "the probe is premature"
+    );
+
+    // The original's SACK arrives first and reports no duplicate.
+    pair.run(300 - 2 * SRTT.as_millis() as u64);
+    assert!(pair.peers[0].inflight_queue.is_empty());
+    assert!(pair.peers[0].loss_probe.is_some());
+    assert_eq!(pair.peers[0].ssthresh, ssthresh);
+
+    // The probe's duplicate report follows and proves no loss happened.
+    pair.run(2 * SRTT.as_millis() as u64);
+    assert_eq!(
+        pair.sack_log.last().unwrap().1.duplicate_tsn,
+        [tsn],
+        "the peer reports the probe as a duplicate"
+    );
+    assert!(pair.peers[0].loss_probe.is_none());
+    assert_eq!(pair.peers[0].timers.get(Timer::Probe), None);
+    pair.run(1000);
+    assert_eq!(pair.peers[0].cwnd, cwnd);
+    assert_eq!(pair.peers[0].ssthresh, ssthresh);
+    assert!(matches!(
+        pair.peers[0].spurious_recovery,
+        SpuriousRecovery::Idle
+    ));
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(pair.received[1].len(), 1);
+    let deliveries = pair.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].lost_transmissions, 0);
+    assert_eq!(deliveries[0].acked_at, start + Duration::from_millis(300));
 }
 
 #[test]

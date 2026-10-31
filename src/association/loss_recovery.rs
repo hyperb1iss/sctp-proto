@@ -6,9 +6,10 @@
 //!
 //! - A tail loss probe retransmits the last outstanding chunk with the I-bit
 //!   set after the flight stays unacknowledged for one probe timeout. The
-//!   probe leaves cwnd and the RTO untouched. If the probed chunk is then
-//!   acknowledged without a duplicate report, the probe repaired a loss and
-//!   the ordinary fast retransmit window reduction follows (section 7.4).
+//!   probe leaves cwnd and the RTO untouched. If no duplicate report for the
+//!   probed chunk arrives within the probe's lead over the original once it
+//!   is acknowledged, the probe repaired a loss and the ordinary fast
+//!   retransmit window reduction follows (section 7.4).
 //! - RACK early retransmission declares a chunk lost once a chunk sent after
 //!   it has been delivered and a reordering window has passed (section 6).
 //!   It only applies while fewer than three later chunks exist and nothing
@@ -33,8 +34,8 @@ const FAST_RETRANSMIT_THRESHOLD: usize = 3;
 /// Recent TSNs whose duplicate reports our own retransmissions explain.
 const EXPLAINED_HISTORY: usize = 16;
 
-/// Delivery outcome of one DATA chunk, reported when it is first
-/// acknowledged. Enable with
+/// Delivery outcome of one DATA chunk, reported once it is acknowledged and
+/// its losses are known. Enable with
 /// [`TransportConfig::with_data_delivery_reports`](crate::TransportConfig::with_data_delivery_reports)
 /// and drain with [`Association::poll_data_delivery`].
 ///
@@ -54,8 +55,20 @@ pub struct DataDelivery {
     pub bytes: usize,
     /// Transmissions that did not reach the peer. Every retransmission
     /// counts as one loss, except one proven unnecessary by a duplicate
-    /// report in the acknowledging SACK.
+    /// report. A tail loss probe's report waits for that evidence, so it can
+    /// follow reports of chunks acknowledged later.
     pub lost_transmissions: u32,
+}
+
+/// A sent tail loss probe whose outcome is not yet known (RFC 8985 7.4).
+#[derive(Debug)]
+pub(super) struct ProbeEpisode {
+    tsn: u32,
+    /// Time between the probed chunk's original transmission and the probe.
+    lead: Duration,
+    /// Set once the probed chunk is acknowledged without a duplicate report,
+    /// holding its delivery report until the evidence window closes.
+    awaiting: Option<Option<DataDelivery>>,
 }
 
 /// RFC 8985 section 6 state, restricted to unambiguous deliveries.
@@ -98,7 +111,8 @@ fn sent_after(a: (Instant, u32), b: (Instant, u32)) -> bool {
 }
 
 impl Association {
-    /// Next delivery report, oldest first. Always `None` unless
+    /// Next delivery report, in the order outcomes became known. Always
+    /// `None` unless
     /// [`TransportConfig::with_data_delivery_reports`](crate::TransportConfig::with_data_delivery_reports)
     /// enabled them.
     pub fn poll_data_delivery(&mut self) -> Option<DataDelivery> {
@@ -110,32 +124,98 @@ impl Association {
         self.rack_on_delivery(&d, now);
 
         let duplicated = duplicates.contains(&d.tsn);
-        if self.loss_probe == Some(d.tsn) {
-            self.loss_probe = None;
-            // A probe whose original also arrived makes the peer report a
-            // duplicate. Without one, the probe repaired a lost tail.
-            if !duplicated && d.nsent == 2 && !d.abandoned {
-                self.probe_repaired_loss = true;
+        let report = self.delivery_report(&d, duplicated, now);
+        let margin = self.rack_reo_wnd() + PTO_MIN;
+        if let Some(episode) = &mut self.loss_probe {
+            if episode.tsn == d.tsn && episode.awaiting.is_none() {
+                if d.abandoned || duplicated {
+                    // The duplicate proves the original also arrived.
+                    self.loss_probe = None;
+                } else {
+                    // Either the probe repaired a loss, or the original's SACK
+                    // arrived first after a delay increase. The probe's
+                    // duplicate then follows by about the time that separated
+                    // the two transmissions (RFC 8985 section 7.4).
+                    episode.awaiting = Some(report);
+                    let deadline = now + episode.lead + margin;
+                    self.timers.set(Timer::Probe, Some(deadline));
+                    return;
+                }
             }
         }
+        self.push_delivery_report(report);
+    }
 
-        if d.abandoned {
-            return;
+    fn delivery_report(
+        &self,
+        d: &Delivered,
+        duplicated: bool,
+        now: Instant,
+    ) -> Option<DataDelivery> {
+        if d.abandoned || self.delivery_reports.is_none() {
+            return None;
         }
-        let (Some(reports), Some(first_sent), Some(last_sent)) =
-            (self.delivery_reports.as_mut(), d.since, d.last_sent)
-        else {
-            return;
-        };
         let retransmissions = d.nsent.saturating_sub(1);
         let proven_unnecessary = u32::from(duplicated && retransmissions > 0);
-        reports.push_back(DataDelivery {
-            first_sent,
-            last_sent,
+        Some(DataDelivery {
+            first_sent: d.since?,
+            last_sent: d.last_sent?,
             acked_at: now,
             bytes: d.bytes,
             lost_transmissions: retransmissions - proven_unnecessary,
-        });
+        })
+    }
+
+    fn push_delivery_report(&mut self, report: Option<DataDelivery>) {
+        if let (Some(reports), Some(report)) = (self.delivery_reports.as_mut(), report) {
+            reports.push_back(report);
+        }
+    }
+
+    /// A duplicate report for an acknowledged probe proves it unnecessary.
+    pub(super) fn observe_probe_duplicate(&mut self, duplicates: &[u32], now: Instant) {
+        let proven = self
+            .loss_probe
+            .as_ref()
+            .is_some_and(|episode| episode.awaiting.is_some() && duplicates.contains(&episode.tsn));
+        if !proven {
+            return;
+        }
+        if let Some(ProbeEpisode {
+            awaiting: Some(report),
+            ..
+        }) = self.loss_probe.take()
+        {
+            self.timers.stop(Timer::Probe);
+            self.push_delivery_report(report.map(|report| DataDelivery {
+                lost_transmissions: report.lost_transmissions.saturating_sub(1),
+                ..report
+            }));
+            self.arm_loss_probe(now);
+        }
+    }
+
+    /// No duplicate followed the probe: it repaired a lost tail. RFC 8985
+    /// section 7.4.2 then reduces the window as fast retransmit would.
+    fn confirm_probe_repaired_loss(&mut self, now: Instant) {
+        let Some(ProbeEpisode {
+            awaiting: Some(report),
+            ..
+        }) = self.loss_probe.take()
+        else {
+            return;
+        };
+        self.push_delivery_report(report);
+        if !self.in_fast_recovery {
+            self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
+            self.cwnd = self.ssthresh;
+            self.partial_bytes_acked = 0;
+            trace!(
+                "[{}] updated cwnd={} ssthresh={} (TLP)",
+                self.side, self.cwnd, self.ssthresh
+            );
+        }
+        self.arm_loss_probe(now);
     }
 
     /// RFC 8985 section 6.2 steps 1 and 2: track the latest sent delivery.
@@ -284,6 +364,10 @@ impl Association {
     /// Restart the probe timer from now after new data leaves or the
     /// cumulative ACK advances, or stop it when the flight does not qualify.
     pub(super) fn arm_loss_probe(&mut self, now: Instant) {
+        // RFC 8985 section 7.3 allows one probe until its outcome is known.
+        if self.loss_probe.is_some() {
+            return;
+        }
         self.timers.stop(Timer::Probe);
         if self.tail_probe_candidate().is_none() {
             return;
@@ -302,12 +386,19 @@ impl Association {
     /// Stop a running probe timer when the flight no longer qualifies,
     /// without restarting it on acknowledgements that carry no progress.
     pub(super) fn cancel_loss_probe_if_ineligible(&mut self) {
-        if self.timers.get(Timer::Probe).is_some() && self.tail_probe_candidate().is_none() {
+        if self.loss_probe.is_none()
+            && self.timers.get(Timer::Probe).is_some()
+            && self.tail_probe_candidate().is_none()
+        {
             self.timers.stop(Timer::Probe);
         }
     }
 
-    pub(super) fn on_probe_timeout(&mut self) {
+    pub(super) fn on_probe_timeout(&mut self, now: Instant) {
+        if self.loss_probe.is_some() {
+            self.confirm_probe_repaired_loss(now);
+            return;
+        }
         if let Some(tsn) = self.tail_probe_candidate() {
             self.will_send_probe = Some(tsn);
             self.awake_write_loop();
@@ -315,26 +406,18 @@ impl Association {
     }
 
     /// T3-rtx retransmits the whole flight, which supersedes both mechanisms.
+    /// A probed chunk already acknowledged keeps its report as a loss.
     pub(super) fn reset_loss_recovery_on_t3(&mut self) {
         self.timers.stop(Timer::Probe);
         self.timers.stop(Timer::Rack);
         self.will_send_probe = None;
-        self.loss_probe = None;
-    }
-
-    /// Apply RFC 8985 section 7.4.2: a probe that repaired a loss reduces the
-    /// congestion window as fast retransmit would, without collapsing it.
-    pub(super) fn respond_to_probe_repaired_loss(&mut self) {
-        if !core::mem::take(&mut self.probe_repaired_loss) || self.in_fast_recovery {
-            return;
+        if let Some(ProbeEpisode {
+            awaiting: Some(report),
+            ..
+        }) = self.loss_probe.take()
+        {
+            self.push_delivery_report(report);
         }
-        self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
-        self.cwnd = self.ssthresh;
-        self.partial_bytes_acked = 0;
-        trace!(
-            "[{}] updated cwnd={} ssthresh={} (TLP)",
-            self.side, self.cwnd, self.ssthresh
-        );
     }
 
     /// Expect one duplicate report for a TSN we are about to resend early.
@@ -376,6 +459,9 @@ impl Association {
         let Some(c) = self.inflight_queue.get_mut(tsn) else {
             return raw_packets;
         };
+        let lead = c
+            .last_sent
+            .map_or(Duration::ZERO, |sent| now.saturating_duration_since(sent));
         c.nsent += 1;
         c.last_sent = Some(now);
         Association::check_partial_reliability_status(
@@ -392,7 +478,11 @@ impl Association {
         // A probe competes with T3 recovery for the duplicate evidence that
         // spurious timeout detection relies on.
         self.spurious_recovery.invalidate();
-        self.loss_probe = Some(tsn);
+        self.loss_probe = Some(ProbeEpisode {
+            tsn,
+            lead,
+            awaiting: None,
+        });
         self.explain_duplicate(tsn);
         self.stats.inc_loss_probes();
         self.timers

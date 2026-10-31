@@ -39,7 +39,7 @@ use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
-use loss_recovery::{Delivered, Rack};
+use loss_recovery::{Delivered, ProbeEpisode, Rack};
 use spurious_recovery::SpuriousRecovery;
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
@@ -322,10 +322,8 @@ pub struct Association {
     // Tail loss probe (RFC 8985 section 7)
     /// TSN chosen by an expired probe timer, sent by the next transmit poll.
     will_send_probe: Option<u32>,
-    /// TSN retransmitted by the outstanding probe until it is acknowledged.
-    loss_probe: Option<u32>,
-    /// Set when an acknowledgement shows that a probe repaired a loss.
-    probe_repaired_loss: bool,
+    /// The sent probe until its outcome is known.
+    loss_probe: Option<ProbeEpisode>,
     /// TSNs retransmitted by a probe or RACK whose duplicate reports that
     /// retransmission explains.
     explained_duplicates: VecDeque<u32>,
@@ -438,7 +436,6 @@ impl Default for Association {
 
             will_send_probe: None,
             loss_probe: None,
-            probe_repaired_loss: false,
             explained_duplicates: VecDeque::default(),
             rack: Rack::default(),
             delivery_reports: None,
@@ -822,7 +819,7 @@ impl Association {
                 self.on_ack_timeout();
             } else if timer == Timer::Probe {
                 self.timers.stop(timer);
-                self.on_probe_timeout();
+                self.on_probe_timeout(now);
             } else if timer == Timer::Rack {
                 self.timers.stop(timer);
                 self.on_rack_timeout(now);
@@ -2558,7 +2555,6 @@ impl Association {
             cum_tsn_ack_point_advanced = true;
             self.on_cumulative_tsn_ack_point_advanced(total_bytes_acked, now);
         }
-        self.respond_to_probe_repaired_loss();
 
         for (si, n_bytes_acked) in &bytes_acked_per_stream {
             if let Some(s) = self.streams.get_mut(si) {
@@ -2636,6 +2632,7 @@ impl Association {
             self.cancel_loss_probe_if_ineligible();
         }
 
+        self.observe_probe_duplicate(&d.duplicate_tsn, now);
         let duplicates = self.unexplained_duplicates(&d.duplicate_tsn);
         if let Some(threshold) = self.spurious_recovery.sack(
             previous_cumulative,
