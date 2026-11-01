@@ -781,6 +781,47 @@ fn rack_judges_a_hole_before_three_bundled_chunks() {
 }
 
 #[test]
+fn lost_tail_after_a_repaired_hole_is_probed() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 20 * mtu;
+    let cwnd = pair.peers[0].cwnd;
+    let first = pair.next_tsn();
+    let tail = first + 2;
+    pair.drop_tsns.extend([first, tail]);
+    for index in 0..3u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    // RACK repairs the hole and fast recovery waits on the tail, which no
+    // SACK will report. Once the repair is acknowledged, the quiet tail is
+    // probed instead of waiting for T3-rtx.
+    pair.run(1000);
+    assert_eq!(pair.received[1].len(), 3);
+    let probe = &pair.transmissions_of(tail)[1];
+    let repair_acked = pair
+        .sack_log
+        .iter()
+        .find(|(_, sack)| sack.cumulative_tsn_ack == first + 1)
+        .unwrap()
+        .0;
+    assert_eq!(probe.at, repair_acked + 2 * SRTT);
+    assert!(probe.chunk.immediate_sack);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_early_retrans(), 1);
+    assert_eq!(stats.get_num_loss_probes(), 1);
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert!(!pair.peers[0].in_fast_recovery);
+    assert_eq!(
+        pair.peers[0].ssthresh,
+        cwnd / 2,
+        "one reduction per recovery"
+    );
+}
+
+#[test]
 fn rack_leaves_chunks_awaiting_t3_to_t3() {
     let mut pair = Pair::warmed_up();
     let mtu = pair.peers[0].mtu;
@@ -829,4 +870,35 @@ fn rack_skips_chunks_queued_for_t3_retransmission() {
     assert!(!pair.peers[0].in_fast_recovery);
     pair.flush();
     assert_eq!(pair.transmissions_of(first).len(), 2);
+}
+
+#[test]
+fn progress_restarts_a_probe_that_has_not_left() {
+    let mut pair = Pair::warmed_up();
+    let first = pair.next_tsn();
+    pair.drop_tsns.push(first + 1);
+    let start = pair.now;
+    pair.write(0, &vec![23; PAYLOAD_SIZE as usize + 100]);
+    // The first fragment arrives without the I-bit, so the peer holds its
+    // SACK while the probe timer runs out.
+    pair.run(2 * SRTT.as_millis() as u64 - 1);
+    let probe_at = start + 2 * SRTT;
+    pair.now = probe_at;
+    pair.peers[0].handle_timeout(probe_at);
+    assert_eq!(pair.peers[0].will_send_probe, Some(first + 1));
+
+    // The held SACK lands before the next transmit poll.
+    let sack = pair.peers[1].create_selective_ack_chunk();
+    assert_eq!(sack.cumulative_tsn_ack, first);
+    pair.peers[0].handle_sack(&sack, probe_at).unwrap();
+    assert_eq!(pair.peers[0].will_send_probe, None);
+    // The held SACK also carried a 40 ms RTT sample.
+    let srtt = pair.peers[0].rto_mgr.srtt;
+    assert!(srtt > SRTT.as_millis() as u64);
+    assert_eq!(
+        pair.peers[0].timers.get(Timer::Probe),
+        Some(probe_at + Duration::from_millis(2 * srtt))
+    );
+    pair.flush();
+    assert_eq!(pair.transmissions_of(first + 1).len(), 1);
 }

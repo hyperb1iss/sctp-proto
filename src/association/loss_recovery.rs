@@ -363,15 +363,15 @@ impl Association {
 
     /// The last outstanding TSN when the flight is a quiet tail a probe may
     /// repair: nothing queued, no reported holes, no retransmission pending.
+    /// Fast recovery qualifies once its repairs are acknowledged, since a
+    /// lost tail past the repaired hole draws no SACK to report it.
     fn tail_probe_candidate(&self) -> Option<u32> {
         if !matches!(
             self.state,
             AssociationState::Established
                 | AssociationState::ShutdownPending
                 | AssociationState::ShutdownReceived
-        ) || self.in_fast_recovery
-            || self.will_retransmit_fast
-            || self.loss_probe.is_some()
+        ) || self.loss_probe.is_some()
             || self.will_send_probe.is_some()
             || !self.pending_queue.is_empty()
         {
@@ -380,7 +380,8 @@ impl Association {
         let last = *self.inflight_queue.sorted.last()?;
         for tsn in &self.inflight_queue.sorted {
             let c = self.inflight_queue.get(*tsn)?;
-            if c.acked || c.retransmit || c.nsent != 1 {
+            let fast_retransmit_pending = c.miss_indicator >= FAST_RETRANSMIT_THRESHOLD as u32;
+            if c.acked || c.retransmit || c.nsent != 1 || fast_retransmit_pending {
                 return None;
             }
         }
@@ -390,11 +391,14 @@ impl Association {
 
     /// Restart the probe timer from now after new data leaves or the
     /// cumulative ACK advances, or stop it when the flight does not qualify.
+    /// Either event also replaces a probe chosen but not yet sent: new data
+    /// probes the path itself, and progress shows the tail is not quiet.
     pub(super) fn arm_loss_probe(&mut self, now: Instant) {
         // RFC 8985 section 7.3 allows one probe until its outcome is known.
         if self.loss_probe.is_some() {
             return;
         }
+        self.will_send_probe = None;
         self.timers.stop(Timer::Probe);
         if self.tail_probe_candidate().is_none() {
             return;
@@ -509,7 +513,8 @@ impl Association {
             tsn,
             lead,
             awaiting: None,
-            window_reduced: false,
+            // A tail lost within fast recovery belongs to its one reduction.
+            window_reduced: self.in_fast_recovery,
         });
         self.explain_duplicate(tsn);
         self.stats.inc_loss_probes();

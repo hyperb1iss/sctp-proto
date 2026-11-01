@@ -3704,9 +3704,7 @@ impl Association {
                 }
             }
 
-            // RFC 8985 section 7.2 restarts the probe timer after new data,
-            // which also takes the place of a probe that has not left yet.
-            self.will_send_probe = None;
+            // RFC 8985 section 7.2 restarts the probe timer after new data.
             self.arm_loss_probe(now);
         }
 
