@@ -730,3 +730,27 @@ fn delivery_reports_are_opt_in() {
     assert!(association.delivery_reports.is_none());
     assert_eq!(association.poll_data_delivery(), None);
 }
+
+#[test]
+fn probe_verdict_after_recovery_does_not_reduce_twice() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    // Start well above the 4 MTU floor so two reductions are visible.
+    pair.peers[0].cwnd = 20 * mtu;
+    let cwnd = pair.peers[0].cwnd;
+    let first = pair.next_tsn();
+    pair.drop_tsns.extend([first, first + 1]);
+    pair.write(0, &vec![22; PAYLOAD_SIZE as usize + 100]);
+
+    // The probe's SACK reveals the hole, RACK enters fast recovery, and the
+    // repair ends it before the probe's verdict window closes.
+    pair.run(1000);
+    assert_eq!(pair.received[1].len(), 1);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_loss_probes(), 1);
+    assert_eq!(stats.get_num_early_retrans(), 1);
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert!(pair.peers[0].loss_probe.is_none());
+    assert_eq!(pair.peers[0].ssthresh, cwnd / 2, "one loss episode");
+    assert_eq!(pair.peers[0].cwnd, cwnd / 2);
+}

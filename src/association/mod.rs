@@ -3278,6 +3278,8 @@ impl Association {
         cum_tsn_ack_point_advanced: bool,
         now: Instant,
     ) -> Result<()> {
+        let was_in_fast_recovery = self.in_fast_recovery;
+
         // HTNA algorithm - RFC 4960 Sec 7.2.4
         // Increment missIndicator of each chunks that the SACK reported missing
         // when either of the following is met:
@@ -3331,6 +3333,9 @@ impl Association {
 
         if self.in_fast_recovery && cum_tsn_ack_point_advanced {
             self.will_retransmit_fast = true;
+        }
+        if self.in_fast_recovery && !was_in_fast_recovery {
+            self.on_fast_recovery_entered();
         }
 
         // Small flights cannot accumulate three miss indications.

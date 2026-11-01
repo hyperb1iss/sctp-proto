@@ -69,6 +69,9 @@ pub(super) struct ProbeEpisode {
     /// Set once the probed chunk is acknowledged without a duplicate report,
     /// holding its delivery report until the evidence window closes.
     awaiting: Option<Option<DataDelivery>>,
+    /// Fast recovery began during the episode and already reduced the
+    /// window for this loss.
+    window_reduced: bool,
 }
 
 /// RFC 8985 section 6 state, restricted to unambiguous deliveries.
@@ -198,15 +201,23 @@ impl Association {
     /// No duplicate followed the probe: it repaired a lost tail. RFC 8985
     /// section 7.4.2 then reduces the window as fast retransmit would.
     fn confirm_probe_repaired_loss(&mut self, now: Instant) {
+        let judged = self
+            .loss_probe
+            .as_ref()
+            .is_some_and(|episode| episode.awaiting.is_some());
+        if !judged {
+            return;
+        }
         let Some(ProbeEpisode {
             awaiting: Some(report),
+            window_reduced,
             ..
         }) = self.loss_probe.take()
         else {
             return;
         };
         self.push_delivery_report(report);
-        if !self.in_fast_recovery {
+        if !self.in_fast_recovery && !window_reduced {
             self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
             self.cwnd = self.ssthresh;
             self.partial_bytes_acked = 0;
@@ -301,6 +312,7 @@ impl Association {
         }
         // RFC 9260 section 7.2.4 rule 2: one reduction per recovery, exiting
         // once the highest outstanding TSN is acknowledged.
+        self.on_fast_recovery_entered();
         self.in_fast_recovery = true;
         self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
         self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
@@ -312,6 +324,14 @@ impl Association {
             self.side, self.cwnd, self.ssthresh
         );
         None
+    }
+
+    /// Fast recovery reduces the window once for the losses it repairs, which
+    /// includes any loss an open probe episode would otherwise report.
+    pub(super) fn on_fast_recovery_entered(&mut self) {
+        if let Some(episode) = &mut self.loss_probe {
+            episode.window_reduced = true;
+        }
     }
 
     /// Re-evaluate RACK and keep its timer on the next window expiry.
@@ -482,6 +502,7 @@ impl Association {
             tsn,
             lead,
             awaiting: None,
+            window_reduced: false,
         });
         self.explain_duplicate(tsn);
         self.stats.inc_loss_probes();
