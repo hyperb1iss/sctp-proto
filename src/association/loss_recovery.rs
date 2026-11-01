@@ -12,8 +12,10 @@
 //!   retransmit window reduction follows (section 7.4).
 //! - RACK early retransmission declares a chunk lost once a chunk sent after
 //!   it has been delivered and a reordering window has passed (section 6).
-//!   It only applies while fewer than three later chunks exist and nothing
-//!   else is queued, so the three-miss rule could never fire.
+//!   It only judges a hole the three-miss rule can no longer reach: every
+//!   further miss indication needs a SACK that newly acknowledges a later
+//!   chunk, so the hole's misses plus its unacknowledged later chunks must
+//!   stay below three, with nothing else queued.
 
 use super::*;
 
@@ -28,7 +30,7 @@ pub(super) const PTO_MIN: Duration = Duration::from_millis(10);
 /// Lower bound on the RACK reordering window, the RTT sample granularity.
 const REO_WND_MIN: Duration = Duration::from_millis(1);
 
-/// Later chunks needed before the three-miss rule can detect a loss.
+/// Miss indications that trigger fast retransmit (RFC 9260 section 7.2.4).
 const FAST_RETRANSMIT_THRESHOLD: usize = 3;
 
 /// Recent TSNs whose duplicate reports our own retransmissions explain.
@@ -270,18 +272,23 @@ impl Association {
         let latest = self.rack.xmit?;
         let window = self.rack.rtt + self.rack_reo_wnd();
 
-        let total = self.inflight_queue.sorted.len();
         let mut lost = vec![];
         let mut next_check: Option<Instant> = None;
-        for (index, &tsn) in self.inflight_queue.sorted.iter().enumerate() {
-            let later = total - index - 1;
-            if later >= FAST_RETRANSMIT_THRESHOLD {
-                continue;
-            }
+        // Walk from the highest TSN down, counting unacknowledged later chunks.
+        let mut unacked_later = 0;
+        for &tsn in self.inflight_queue.sorted.iter().rev() {
             let Some(c) = self.inflight_queue.get(tsn) else {
                 continue;
             };
-            if c.acked || c.abandoned() || c.nsent != 1 || c.miss_indicator >= 3 {
+            let later = unacked_later;
+            if !c.acked {
+                unacked_later += 1;
+            }
+            if c.acked || c.abandoned() || c.retransmit || c.nsent != 1 {
+                continue;
+            }
+            // The three-miss rule can still fire for this hole.
+            if c.miss_indicator as usize + later >= FAST_RETRANSMIT_THRESHOLD {
                 continue;
             }
             let Some(sent) = c.last_sent else {

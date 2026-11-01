@@ -754,3 +754,79 @@ fn probe_verdict_after_recovery_does_not_reduce_twice() {
     assert_eq!(pair.peers[0].ssthresh, cwnd / 2, "one loss episode");
     assert_eq!(pair.peers[0].cwnd, cwnd / 2);
 }
+
+#[test]
+fn rack_judges_a_hole_before_three_bundled_chunks() {
+    let mut pair = Pair::warmed_up();
+    let first = pair.next_tsn();
+    pair.drop_tsns.push(first);
+    let start = pair.now;
+    for (index, len) in [PAYLOAD_SIZE as usize, 60, 60, 60].into_iter().enumerate() {
+        let message = vec![index as u8; len];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+    // Three later chunks share one packet, so only one SACK reports the
+    // hole and the three-miss rule can never fire.
+    assert_eq!(pair.network.len(), 1);
+
+    pair.run(1000);
+    let attempts = pair.transmissions_of(first);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].at - start, SRTT + SRTT / 4);
+    assert_eq!(pair.received[1].len(), 4);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_early_retrans(), 1);
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+}
+
+#[test]
+fn rack_leaves_chunks_awaiting_t3_to_t3() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 40 * mtu;
+    let first = pair.next_tsn();
+    // Every chunk is lost, and so is the probe of the last one.
+    pair.drop_tsns
+        .extend([first, first + 1, first + 2, first + 2]);
+    for index in 0..3u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    // T3-rtx resends the flight, and its deliveries must not start a fast
+    // recovery on top of the timeout.
+    pair.run(2000);
+    assert_eq!(pair.received[1].len(), 3);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 1);
+    assert_eq!(stats.get_num_early_retrans(), 0);
+    assert_eq!(stats.get_num_fast_retrans(), 0);
+}
+
+#[test]
+fn rack_skips_chunks_queued_for_t3_retransmission() {
+    let mut pair = Pair::warmed_up();
+    let first = pair.next_tsn();
+    pair.drop_tsns.push(first);
+    let start = pair.now;
+    pair.write(0, &vec![24; 2 * PAYLOAD_SIZE as usize + 100]);
+    pair.run(SRTT.as_millis() as u64);
+    assert_eq!(
+        pair.peers[0].timers.get(Timer::Rack),
+        Some(start + SRTT + SRTT / 4)
+    );
+
+    // T3-rtx has queued the hole, and the reordering window closes before
+    // the next transmit poll sends it. T3 owns that retransmission, so RACK
+    // must not count it as an early one or start a fast recovery.
+    pair.peers[0].inflight_queue.mark_all_to_retrasmit();
+    let due = start + SRTT + SRTT / 4;
+    pair.now = due;
+    pair.peers[0].handle_timeout(due);
+    assert_eq!(pair.stats().get_num_early_retrans(), 0);
+    assert!(!pair.peers[0].in_fast_recovery);
+    pair.flush();
+    assert_eq!(pair.transmissions_of(first).len(), 2);
+}
