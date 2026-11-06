@@ -12,10 +12,18 @@
 //!   retransmit window reduction follows (section 7.4).
 //! - RACK early retransmission declares a chunk lost once a chunk sent after
 //!   it has been delivered and a reordering window has passed (section 6).
-//!   It only judges a hole the three-miss rule can no longer reach: every
-//!   further miss indication needs a SACK that newly acknowledges a later
-//!   chunk, so the hole's misses plus its unacknowledged later chunks must
-//!   stay below three, with nothing else queued.
+//!   While later transmissions are still in flight it only judges a hole
+//!   the three-miss rule can no longer reach: every further miss indication
+//!   needs a SACK that newly acknowledges a later chunk, so the hole's
+//!   misses plus its unacknowledged later chunks must stay below three,
+//!   with nothing else queued. Once the tail is quiet, with every
+//!   outstanding transmission sent before the latest delivered one, no
+//!   SACK can come except in answer to a repair, so RACK judges them all by
+//!   time, retransmissions included (section 3.1).
+//!
+//! Repairs leave as the congestion window allows, and a repair lost in a
+//! quiet tail is probed like new data. A lost retransmission lowers the
+//! window once more, once per round of repairs (section 9.3).
 
 use super::*;
 
@@ -74,6 +82,9 @@ pub(super) struct ProbeEpisode {
     /// Fast recovery began during the episode and already reduced the
     /// window for this loss.
     window_reduced: bool,
+    /// When the probed chunk's previous transmission left, if that was a
+    /// retransmission. A probe that repairs it found a lost retransmission.
+    probed_retransmission: Option<Instant>,
 }
 
 /// RFC 8985 section 6 state, restricted to unambiguous deliveries.
@@ -113,6 +124,15 @@ impl Delivered {
 /// Whether transmission `a` left after transmission `b` (RFC 8985 section 6.2).
 fn sent_after(a: (Instant, u32), b: (Instant, u32)) -> bool {
     a.0 > b.0 || (a.0 == b.0 && sna32gt(a.1, b.1))
+}
+
+/// Whether fast retransmission owes this chunk a resend: three miss
+/// indications on its first transmission, or RACK finding a retransmission
+/// lost.
+pub(super) fn awaits_fast_retransmit(c: &ChunkPayloadData) -> bool {
+    !c.acked
+        && !c.abandoned()
+        && (c.lost_again || (c.nsent == 1 && c.miss_indicator >= FAST_RETRANSMIT_THRESHOLD as u32))
 }
 
 impl Association {
@@ -213,6 +233,7 @@ impl Association {
         let Some(ProbeEpisode {
             awaiting: Some(report),
             window_reduced,
+            probed_retransmission,
             ..
         }) = self.loss_probe.take()
         else {
@@ -223,10 +244,17 @@ impl Association {
             self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
             self.cwnd = self.ssthresh;
             self.partial_bytes_acked = 0;
+            self.recovery_reduced_at = Some(now);
             trace!(
                 "[{}] updated cwnd={} ssthresh={} (TLP)",
                 self.side, self.cwnd, self.ssthresh
             );
+        } else if probed_retransmission.is_some_and(|sent| {
+            self.recovery_reduced_at
+                .is_none_or(|reduced_at| sent >= reduced_at)
+        }) {
+            // The probe repaired a lost repair (RFC 8985 section 9.3).
+            self.reduce_window_for_loss(true, now);
         }
         self.arm_loss_probe(now);
     }
@@ -266,11 +294,15 @@ impl Association {
     /// reordering window has passed for fast retransmission, and returns when
     /// the earliest remaining candidate's window closes.
     fn rack_detect_loss(&mut self, now: Instant) -> Option<Instant> {
-        if self.in_fast_recovery || !self.pending_queue.is_empty() {
+        if !self.pending_queue.is_empty() {
             return None;
         }
         let latest = self.rack.xmit?;
         let window = self.rack.rtt + self.rack_reo_wnd();
+        let quiet = self.rack_tail_is_quiet(latest);
+        if self.in_fast_recovery && !quiet {
+            return None;
+        }
 
         let mut lost = vec![];
         let mut next_check: Option<Instant> = None;
@@ -284,11 +316,13 @@ impl Association {
             if !c.acked {
                 unacked_later += 1;
             }
-            if c.acked || c.abandoned() || c.retransmit || c.nsent != 1 {
+            if c.acked || c.abandoned() || c.retransmit || awaits_fast_retransmit(c) {
                 continue;
             }
             // The three-miss rule can still fire for this hole.
-            if c.miss_indicator as usize + later >= FAST_RETRANSMIT_THRESHOLD {
+            if !quiet
+                && (c.nsent != 1 || c.miss_indicator as usize + later >= FAST_RETRANSMIT_THRESHOLD)
+            {
                 continue;
             }
             let Some(sent) = c.last_sent else {
@@ -309,28 +343,86 @@ impl Association {
             return next_check;
         }
 
+        // The latest transmission among lost retransmissions.
+        let mut lost_retransmission: Option<Instant> = None;
         for tsn in lost {
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                c.miss_indicator = 3;
+                if c.nsent == 1 {
+                    c.miss_indicator = FAST_RETRANSMIT_THRESHOLD as u32;
+                } else {
+                    c.lost_again = true;
+                    lost_retransmission = lost_retransmission.max(c.last_sent);
+                }
+                let nsent = c.nsent;
                 self.stats.inc_early_retrans();
                 self.explain_duplicate(tsn);
-                trace!("[{}] RACK early retransmit: tsn={}", self.side, tsn);
+                trace!(
+                    "[{}] RACK early retransmit: tsn={} sent={}",
+                    self.side, tsn, nsent
+                );
             }
         }
-        // RFC 9260 section 7.2.4 rule 2: one reduction per recovery, exiting
-        // once the highest outstanding TSN is acknowledged.
-        self.on_fast_recovery_entered();
-        self.in_fast_recovery = true;
-        self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
-        self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
-        self.cwnd = self.ssthresh;
-        self.partial_bytes_acked = 0;
+        // A retransmission sent since the window last came down and lost
+        // anyway is a second congestion signal. Other losses in the same
+        // round of repairs share its one reduction (RFC 8985 section 9.3).
+        let lost_since_reduction = lost_retransmission.is_some_and(|sent| {
+            self.recovery_reduced_at
+                .is_none_or(|reduced_at| sent >= reduced_at)
+        });
+        if !self.in_fast_recovery {
+            // RFC 9260 section 7.2.4 rule 2: one reduction per recovery,
+            // exiting once the highest outstanding TSN is acknowledged.
+            self.on_fast_recovery_entered();
+            self.in_fast_recovery = true;
+            self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
+            self.reduce_window_for_loss(lost_retransmission.is_some(), now);
+        } else if lost_since_reduction {
+            self.reduce_window_for_loss(true, now);
+        }
         self.will_retransmit_fast = true;
+        None
+    }
+
+    /// Every outstanding transmission left before the latest delivered one,
+    /// so no SACK can arrive except in answer to a repair. Chunks T3-rtx has
+    /// queued are about to leave again, so the tail is not quiet.
+    fn rack_tail_is_quiet(&self, latest: (Instant, u32)) -> bool {
+        self.inflight_queue.sorted.iter().all(|&tsn| {
+            self.inflight_queue.get(tsn).is_none_or(|c| {
+                c.acked
+                    || c.abandoned()
+                    || (!c.retransmit
+                        && c.last_sent
+                            .is_some_and(|sent| sent_after(latest, (sent, tsn))))
+            })
+        })
+    }
+
+    /// Halve the window to its fast retransmit floor (RFC 9260 section
+    /// 7.2.3). A reduction for a lost retransmission never raises a window
+    /// that T3-rtx already collapsed below that floor.
+    fn reduce_window_for_loss(&mut self, retransmission_lost: bool, now: Instant) {
+        self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
+        self.cwnd = if retransmission_lost {
+            self.cwnd.min(self.ssthresh)
+        } else {
+            self.ssthresh
+        };
+        self.partial_bytes_acked = 0;
+        self.recovery_reduced_at = Some(now);
         trace!(
             "[{}] updated cwnd={} ssthresh={} (RACK)",
             self.side, self.cwnd, self.ssthresh
         );
-        None
+    }
+
+    /// Whether any chunk still waits for its fast retransmission.
+    pub(super) fn fast_retransmit_due(&self) -> bool {
+        self.inflight_queue.sorted.iter().any(|tsn| {
+            self.inflight_queue
+                .get(*tsn)
+                .is_some_and(awaits_fast_retransmit)
+        })
     }
 
     /// Fast recovery reduces the window once for the losses it repairs, which
@@ -361,10 +453,12 @@ impl Association {
             .then(|| Duration::from_millis(self.rto_mgr.srtt.saturating_mul(2)).max(PTO_MIN))
     }
 
-    /// The last outstanding TSN when the flight is a quiet tail a probe may
-    /// repair: nothing queued, no reported holes, no retransmission pending.
-    /// Fast recovery qualifies once its repairs are acknowledged, since a
-    /// lost tail past the repaired hole draws no SACK to report it.
+    /// The highest outstanding TSN when the flight is a quiet tail a probe
+    /// may repair: nothing queued and no retransmission pending. Outside
+    /// fast recovery the flight must also be all first transmissions with no
+    /// reported holes. Fast recovery qualifies once its repairs have left,
+    /// since a lost tail past the repaired holes, or a lost repair, draws no
+    /// SACK to report it.
     fn tail_probe_candidate(&self) -> Option<u32> {
         if !matches!(
             self.state,
@@ -377,16 +471,21 @@ impl Association {
         {
             return None;
         }
-        let last = *self.inflight_queue.sorted.last()?;
+        let mut candidate = None;
         for tsn in &self.inflight_queue.sorted {
             let c = self.inflight_queue.get(*tsn)?;
-            let fast_retransmit_pending = c.miss_indicator >= FAST_RETRANSMIT_THRESHOLD as u32;
-            if c.acked || c.retransmit || c.nsent != 1 || fast_retransmit_pending {
+            if c.retransmit || awaits_fast_retransmit(c) {
                 return None;
             }
+            if !self.in_fast_recovery && (c.acked || c.nsent != 1) {
+                return None;
+            }
+            if !c.acked {
+                candidate = Some(*tsn);
+            }
         }
-        let c = self.inflight_queue.get(last)?;
-        (!c.abandoned()).then_some(last)
+        let tsn = candidate?;
+        (!self.inflight_queue.get(tsn)?.abandoned()).then_some(tsn)
     }
 
     /// Restart the probe timer from now after new data leaves or the
@@ -493,6 +592,7 @@ impl Association {
         let lead = c
             .last_sent
             .map_or(Duration::ZERO, |sent| now.saturating_duration_since(sent));
+        let probed_retransmission = c.last_sent.filter(|_| c.nsent > 1);
         c.nsent += 1;
         c.last_sent = Some(now);
         Association::check_partial_reliability_status(
@@ -515,6 +615,7 @@ impl Association {
             awaiting: None,
             // A tail lost within fast recovery belongs to its one reduction.
             window_reduced: self.in_fast_recovery,
+            probed_retransmission,
         });
         self.explain_duplicate(tsn);
         self.stats.inc_loss_probes();

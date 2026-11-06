@@ -117,6 +117,9 @@ pub struct ChunkPayloadData {
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
+    /// RACK found a retransmission of this chunk lost, so fast
+    /// retransmission owes it another one.
+    pub(crate) lost_again: bool,
 }
 
 impl Default for ChunkPayloadData {
@@ -139,6 +142,7 @@ impl Default for ChunkPayloadData {
             abandoned: false,
             all_inflight: false,
             retransmit: false,
+            lost_again: false,
         }
     }
 }
@@ -218,6 +222,7 @@ impl Chunk for ChunkPayloadData {
             abandoned: false,
             all_inflight: false,
             retransmit: false,
+            lost_again: false,
         })
     }
 

@@ -180,6 +180,8 @@ impl PayloadQueue {
                 continue;
             }
             c.retransmit = true;
+            // T3-rtx now owns every resend.
+            c.lost_again = false;
         }
     }
 

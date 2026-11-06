@@ -59,6 +59,7 @@ fn sacks(packet: &Bytes) -> Vec<ChunkSelectiveAck> {
 struct Transmission {
     at: Instant,
     chunk: ChunkPayloadData,
+    dropped: bool,
 }
 
 /// Two associations joined by a virtual link stepped in 1 ms ticks.
@@ -77,6 +78,9 @@ struct Pair {
     delay_tsns: Vec<(u32, Duration)>,
     /// Drop this many SACK-bearing packets from peer 1.
     drop_sacks: usize,
+    /// Drop each packet from peer 0 with this probability in thousandths,
+    /// from a seeded generator.
+    random_loss: Option<(u64, u64)>,
     sent: [Vec<Transmission>; 2],
     sack_log: Vec<(Instant, ChunkSelectiveAck)>,
     received: [Vec<(Instant, Vec<u8>)>; 2],
@@ -94,6 +98,7 @@ impl Pair {
             drop_tsns: vec![],
             delay_tsns: vec![],
             drop_sacks: 0,
+            random_loss: None,
             sent: [vec![], vec![]],
             sack_log: vec![],
             received: [vec![], vec![]],
@@ -134,10 +139,12 @@ impl Pair {
 
     fn route(&mut self, from: usize, packet: Bytes) {
         let data = data_chunks(&packet);
+        let dropped = from == 0 && self.drops(&data);
         for chunk in &data {
             self.sent[from].push(Transmission {
                 at: self.now,
                 chunk: chunk.clone(),
+                dropped,
             });
         }
         let mut arrival = self.now + self.one_way;
@@ -146,12 +153,7 @@ impl Pair {
                 arrival = arrival.max(last + self.spacing);
             }
             self.last_arrival = Some(arrival);
-            if let Some(index) = self
-                .drop_tsns
-                .iter()
-                .position(|tsn| data.iter().any(|chunk| chunk.tsn == *tsn))
-            {
-                self.drop_tsns.remove(index);
+            if dropped {
                 return;
             }
             if let Some(index) = self
@@ -169,6 +171,25 @@ impl Pair {
             }
         }
         self.network.push((arrival, 1 - from, packet));
+    }
+
+    /// Whether the link drops this packet from peer 0.
+    fn drops(&mut self, data: &[ChunkPayloadData]) -> bool {
+        if let Some(index) = self
+            .drop_tsns
+            .iter()
+            .position(|tsn| data.iter().any(|chunk| chunk.tsn == *tsn))
+        {
+            self.drop_tsns.remove(index);
+            return true;
+        }
+        let Some((state, permille)) = &mut self.random_loss else {
+            return false;
+        };
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) % 1000 < *permille
     }
 
     fn tick(&mut self) {
@@ -781,7 +802,7 @@ fn rack_judges_a_hole_before_three_bundled_chunks() {
 }
 
 #[test]
-fn lost_tail_after_a_repaired_hole_is_probed() {
+fn lost_tail_after_a_repaired_hole_is_judged_by_the_repair() {
     let mut pair = Pair::warmed_up();
     let mtu = pair.peers[0].mtu;
     pair.peers[0].cwnd = 20 * mtu;
@@ -796,22 +817,23 @@ fn lost_tail_after_a_repaired_hole_is_probed() {
     pair.flush();
 
     // RACK repairs the hole and fast recovery waits on the tail, which no
-    // SACK will report. Once the repair is acknowledged, the quiet tail is
-    // probed instead of waiting for T3-rtx.
+    // SACK will report. The repair left after the tail did, so once it is
+    // acknowledged the tail counts as lost and is resent at once, as in
+    // RFC 8985 section 9.1 example 1, instead of waiting for T3-rtx.
     pair.run(1000);
     assert_eq!(pair.received[1].len(), 3);
-    let probe = &pair.transmissions_of(tail)[1];
+    let repair = &pair.transmissions_of(tail)[1];
     let repair_acked = pair
         .sack_log
         .iter()
         .find(|(_, sack)| sack.cumulative_tsn_ack == first + 1)
         .unwrap()
         .0;
-    assert_eq!(probe.at, repair_acked + 2 * SRTT);
-    assert!(probe.chunk.immediate_sack);
+    assert_eq!(repair.at, repair_acked);
+    assert!(repair.chunk.immediate_sack);
     let mut stats = pair.stats();
-    assert_eq!(stats.get_num_early_retrans(), 1);
-    assert_eq!(stats.get_num_loss_probes(), 1);
+    assert_eq!(stats.get_num_early_retrans(), 2);
+    assert_eq!(stats.get_num_loss_probes(), 0);
     assert_eq!(stats.get_num_t3timeouts(), 0);
     assert!(!pair.peers[0].in_fast_recovery);
     assert_eq!(
@@ -901,4 +923,225 @@ fn progress_restarts_a_probe_that_has_not_left() {
     );
     pair.flush();
     assert_eq!(pair.transmissions_of(first + 1).len(), 1);
+}
+
+/// The Remote Release cap-1mbps trace behind this fix: a token-bucket
+/// policer dropped TSNs 731 to 736, the tail loss probe of 736 got through,
+/// and the repair of 734 was dropped again. The probe's SACK let RACK mark
+/// only 734 and 735, fast retransmission resent one MTU, nothing could
+/// probe after it, and the response waited 385 ms for T3-rtx.
+#[test]
+fn tail_drop_with_a_lost_repair_recovers_without_t3() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 20 * mtu;
+    let cwnd = pair.peers[0].cwnd;
+    let rto = Duration::from_millis(pair.peers[0].rto_mgr.get_rto());
+    let first = pair.next_tsn();
+    let tsns = first..first + 6;
+    // Every chunk travels in its own packet, as in the trace. The last
+    // entry drops the first repair of the fourth chunk, 734 there.
+    pair.drop_tsns.extend(tsns.clone().chain([first + 3]));
+    let start = pair.now;
+    let messages = [
+        vec![1; PAYLOAD_SIZE as usize + 119],
+        vec![2; 841],
+        vec![3; 2 * PAYLOAD_SIZE as usize + 1033],
+    ];
+    pair.write(0, &messages[0]);
+    pair.write(0, &messages[1]);
+    pair.run(7);
+    pair.write(0, &messages[2]);
+    let sent = pair.sent[0]
+        .iter()
+        .map(|t| (t.chunk.tsn, t.chunk.user_data.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sent,
+        tsns.clone()
+            .zip([1062, 119, 841, 1062, 1062, 1033])
+            .collect::<Vec<_>>()
+    );
+
+    // The probe of the tail gets through.
+    let probe_at = start + Duration::from_millis(7) + 2 * SRTT;
+    pair.run((probe_at - pair.now).as_millis() as u64);
+    assert_eq!(pair.transmissions_of(first + 5)[1].at, probe_at);
+
+    // Its SACK reports the tail alone. Every other chunk left before it and
+    // the tail is quiet, so RACK marks all five at once, and all five fit
+    // the halved window.
+    pair.run(SRTT.as_millis() as u64);
+    let repaired_at = probe_at + SRTT;
+    for tsn in first..first + 5 {
+        let attempts = pair.transmissions_of(tsn);
+        assert_eq!(attempts.len(), 2, "tsn {tsn}");
+        assert_eq!(attempts[1].at, repaired_at, "tsn {tsn}");
+    }
+    assert_eq!(pair.peers[0].ssthresh, cwnd / 2, "one reduction per round");
+
+    // The other repairs arrive and show the fourth chunk's repair lost.
+    pair.run(1000);
+    let attempts = pair.transmissions_of(first + 3);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[2].at - attempts[1].at, SRTT + SRTT / 4);
+    let received = pair.received[1]
+        .iter()
+        .map(|(_, bytes)| bytes.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(received, messages);
+    let done = pair.received[1][2].0;
+    assert_eq!(done, attempts[2].at + ONE_WAY);
+    assert!(done - start < rto / 3, "{:?}", done - start);
+
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(stats.get_num_loss_probes(), 1);
+    assert_eq!(stats.get_num_early_retrans(), 6);
+    assert_eq!(stats.get_num_fast_retrans(), 6);
+    // The lost repair lowered the window a second time.
+    assert_eq!(pair.peers[0].ssthresh, cwnd / 4);
+    assert_eq!(pair.peers[0].cwnd, cwnd / 4);
+    assert!(pair.peers[0].inflight_queue.is_empty());
+}
+
+#[test]
+fn a_lost_repair_with_nothing_sent_after_it_is_probed() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 20 * mtu;
+    let cwnd = pair.peers[0].cwnd;
+    let first = pair.next_tsn();
+    // The hole is lost, and so is its repair.
+    pair.drop_tsns.extend([first, first]);
+    let start = pair.now;
+    pair.write(0, &vec![4; 2 * PAYLOAD_SIZE as usize]);
+
+    // No later transmission can report the repair lost, so it is probed
+    // two SRTT after it left instead of waiting for T3-rtx.
+    pair.run(1000);
+    let attempts = pair.transmissions_of(first);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[1].at - start, SRTT + SRTT / 4);
+    assert_eq!(attempts[2].at - attempts[1].at, 2 * SRTT);
+    assert!(attempts[2].chunk.immediate_sack);
+    assert_eq!(pair.received[1].len(), 1);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(stats.get_num_loss_probes(), 1);
+    assert_eq!(stats.get_num_early_retrans(), 1);
+    // Recovery halved the window, and the probe's verdict that it repaired
+    // a lost repair halves it again.
+    assert_eq!(pair.peers[0].ssthresh, cwnd / 4);
+    assert!(pair.peers[0].loss_probe.is_none());
+}
+
+#[test]
+fn a_lost_probe_of_a_lost_repair_falls_back_to_t3() {
+    let mut pair = Pair::warmed_up();
+    let first = pair.next_tsn();
+    pair.drop_tsns.extend([first, first, first]);
+    let start = pair.now;
+    let rto = pair.peers[0].rto_mgr.get_rto();
+    pair.write(0, &vec![5; 2 * PAYLOAD_SIZE as usize]);
+    pair.run(2000);
+
+    // One probe per episode: once it is lost too, T3-rtx takes over.
+    let attempts = pair.transmissions_of(first);
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts[2].at - attempts[1].at, 2 * SRTT);
+    assert_eq!(attempts[3].at - start, Duration::from_millis(rto));
+    assert_eq!(pair.received[1].len(), 1);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_loss_probes(), 1);
+    assert_eq!(stats.get_num_t3timeouts(), 1);
+}
+
+#[test]
+fn repairs_leave_as_the_window_allows() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 8 * mtu;
+    let first = pair.next_tsn();
+    // Seven of eight full chunks are lost; only the last arrives.
+    pair.drop_tsns.extend(first..first + 7);
+    for index in 0..8u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+    assert_eq!(pair.sent[0].len(), 8);
+
+    // RACK marks all seven, and the halved window lets the first four
+    // repairs leave. Repairs replace lost bytes in the flight, so the window
+    // counts what is still in flight, not what was declared lost.
+    pair.run(SRTT.as_millis() as u64 + SRTT.as_millis() as u64 / 4);
+    assert_eq!(pair.peers[0].cwnd, 4 * mtu);
+    let repaired = (first..first + 7)
+        .filter(|tsn| pair.transmissions_of(*tsn).len() == 2)
+        .collect::<Vec<_>>();
+    assert_eq!(repaired, (first..first + 4).collect::<Vec<_>>());
+
+    // Each acknowledged repair makes room for the next.
+    pair.run(1000);
+    assert_eq!(pair.received[1].len(), 8);
+    for tsn in first..first + 7 {
+        assert_eq!(pair.transmissions_of(tsn).len(), 2, "tsn {tsn}");
+    }
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_fast_retrans(), 7);
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(stats.get_num_loss_probes(), 0);
+}
+
+#[test]
+fn random_loss_only_repairs_what_was_lost() {
+    for seed in [1u64, 7, 1_234_567] {
+        let mut pair = Pair::warmed_up();
+        pair.random_loss = Some((seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 50));
+        let mut expected = vec![];
+        let mut gap = seed;
+        for index in 0..500usize {
+            let size = [200, 841, PAYLOAD_SIZE as usize + 119, 3157][index % 4];
+            let message = vec![index as u8; size];
+            pair.write(0, &message);
+            expected.push(message);
+            // Requests and responses take turns, a round trip or more apart.
+            gap = gap.wrapping_mul(6364136223846793005).wrapping_add(1);
+            pair.run(25 + (gap >> 33) % 40);
+        }
+        pair.run(3000);
+        let received = pair.received[1]
+            .iter()
+            .map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(received, expected, "seed {seed}");
+
+        // On a link that never reorders and never loses a SACK, RACK and
+        // fast retransmission only repair transmissions that were dropped.
+        // A probe may duplicate one whose SACK was still delayed, once per
+        // episode.
+        let mut needless = 0;
+        let mut dropped = 0;
+        let mut retransmissions = 0;
+        let mut last: std::collections::HashMap<u32, bool> = Default::default();
+        for t in &pair.sent[0] {
+            dropped += usize::from(t.dropped);
+            if let Some(previous_dropped) = last.insert(t.chunk.tsn, t.dropped) {
+                retransmissions += 1;
+                needless += usize::from(!previous_dropped);
+            }
+        }
+        let mut stats = pair.stats();
+        assert!(dropped > 30, "seed {seed}: {dropped} drops");
+        assert!(
+            needless <= stats.get_num_loss_probes() as usize,
+            "seed {seed}: {needless} needless of {retransmissions} retransmissions, {} probes",
+            stats.get_num_loss_probes()
+        );
+        assert!(
+            retransmissions <= dropped + stats.get_num_loss_probes() as usize,
+            "seed {seed}"
+        );
+    }
 }

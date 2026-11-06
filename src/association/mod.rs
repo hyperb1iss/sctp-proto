@@ -318,6 +318,10 @@ pub struct Association {
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
+    /// When loss recovery last lowered the window. A retransmission sent
+    /// since then and lost again earns another reduction (RFC 8985
+    /// section 9.3, RFC 5681 section 4.3).
+    recovery_reduced_at: Option<Instant>,
 
     // Tail loss probe (RFC 8985 section 7)
     /// TSN chosen by an expired probe timer, sent by the next transmit poll.
@@ -433,6 +437,7 @@ impl Default for Association {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+            recovery_reduced_at: None,
 
             will_send_probe: None,
             loss_probe: None,
@@ -826,7 +831,7 @@ impl Association {
             } else if failure {
                 self.on_retransmission_failure(timer);
             } else {
-                self.on_retransmission_timeout(timer, n_rtos);
+                self.on_retransmission_timeout(timer, n_rtos, now);
                 self.timers.start(timer, now, self.rto_mgr.get_rto());
             }
         }
@@ -3313,6 +3318,7 @@ impl Association {
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
+                            self.recovery_reduced_at = Some(now);
 
                             trace!(
                                 "[{}] updated cwnd={} ssthresh={} inflight={} (FR)",
@@ -3331,7 +3337,9 @@ impl Association {
             }
         }
 
-        if self.in_fast_recovery && cum_tsn_ack_point_advanced {
+        // Progress, or any acknowledgement that shrinks the flight, may let
+        // repairs still owed go out (RFC 9260 section 7.2.4 rule 5).
+        if self.in_fast_recovery && (cum_tsn_ack_point_advanced || self.fast_retransmit_due()) {
             self.will_retransmit_fast = true;
         }
         if self.in_fast_recovery && !was_in_fast_recovery {
@@ -3797,82 +3805,104 @@ impl Association {
         mut raw_packets: Vec<Bytes>,
         now: Instant,
     ) -> Vec<Bytes> {
-        if self.will_retransmit_fast {
-            self.spurious_recovery.invalidate();
-            self.will_retransmit_fast = false;
+        if !self.will_retransmit_fast {
+            return raw_packets;
+        }
+        self.spurious_recovery.invalidate();
+        self.will_retransmit_fast = false;
 
-            let mut to_fast_retrans: Vec<ChunkPayloadData> = vec![];
-            let mut fast_retrans_size = COMMON_HEADER_SIZE;
+        // RFC 9260 section 7.2.4 step 3 sends the earliest chunks marked for
+        // fast retransmission that fit one packet at once, whatever cwnd
+        // says. Step 5 keeps the rest marked, "retransmitted later on as
+        // soon as cwnd allows". Count the flight as RFC 6675 counts its
+        // pipe: every outstanding byte except those already declared lost,
+        // which their repairs replace.
+        let due: Vec<u32> = self
+            .inflight_queue
+            .sorted
+            .iter()
+            .copied()
+            .filter(|tsn| {
+                self.inflight_queue
+                    .get(*tsn)
+                    .is_some_and(loss_recovery::awaits_fast_retransmit)
+            })
+            .collect();
+        let lost_bytes: usize = due
+            .iter()
+            .filter_map(|tsn| self.inflight_queue.get(*tsn))
+            .map(|c| c.user_data.len())
+            .sum();
+        let mut pipe = self
+            .inflight_queue
+            .get_num_bytes()
+            .saturating_sub(lost_bytes);
 
-            let mut i = 0;
-            loop {
-                let tsn = self.cumulative_tsn_ack_point + i + 1;
-                if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    if c.acked || c.abandoned() || c.nsent > 1 || c.miss_indicator < 3 {
-                        i += 1;
-                        continue;
-                    }
-
-                    // RFC 4960 Sec 7.2.4 Fast Retransmit on Gap Reports
-                    //  3)  Determine how many of the earliest (i.e., lowest TSN) DATA chunks
-                    //      marked for retransmission will fit into a single packet, subject
-                    //      to constraint of the path MTU of the destination transport
-                    //      address to which the packet is being sent.  Call this value K.
-                    //      Retransmit those K DATA chunks in a single packet.  When a Fast
-                    //      Retransmit is being performed, the sender SHOULD ignore the value
-                    //      of cwnd and SHOULD NOT delay retransmission for this single
-                    //		packet.
-
-                    let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
-                    if self.mtu < fast_retrans_size + data_chunk_size {
-                        break;
-                    }
-
-                    fast_retrans_size += data_chunk_size;
-                    self.stats.inc_fast_retrans();
-                    c.nsent += 1;
-                    c.last_sent = Some(now);
-                } else {
-                    break; // end of pending data
-                }
-
-                if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    Association::check_partial_reliability_status(
-                        c,
-                        now,
-                        self.use_forward_tsn,
-                        self.side,
-                        &self.streams,
-                    );
-                    to_fast_retrans.push(c.clone());
-                    trace!(
-                        "[{}] fast-retransmit: tsn={} sent={} htna={}",
-                        self.side, c.tsn, c.nsent, self.fast_recover_exit_point
-                    );
-                }
-                i += 1;
+        let mut packets: Vec<Vec<ChunkPayloadData>> = vec![];
+        let mut packet: Vec<ChunkPayloadData> = vec![];
+        let mut packet_size = COMMON_HEADER_SIZE;
+        for tsn in due {
+            let Some(c) = self.inflight_queue.get_mut(tsn) else {
+                continue;
+            };
+            let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+            if !packet.is_empty() && packet_size + data_chunk_size > self.mtu {
+                packets.push(core::mem::take(&mut packet));
+                packet_size = COMMON_HEADER_SIZE;
+            }
+            if !packets.is_empty() && pipe + c.user_data.len() > self.cwnd as usize {
+                break;
             }
 
-            if !to_fast_retrans.is_empty() {
-                // A repaired hole would otherwise wait for the peer's delayed
-                // SACK, which can outlast T3-rtx on long paths (RFC 7053).
-                if let Some(last) = to_fast_retrans.last_mut() {
-                    last.immediate_sack = true;
-                }
-                let chunks = to_fast_retrans
-                    .into_iter()
-                    .map(|c| Box::new(c) as Box<dyn Chunk + Send + Sync>)
-                    .collect();
-                if let Ok(raw) = self.create_packet(chunks).marshal() {
-                    raw_packets.push(raw);
-                } else {
-                    warn!(
-                        "[{}] failed to serialize a DATA packet to be fast-retransmitted",
-                        self.side
-                    );
-                }
+            packet_size += data_chunk_size;
+            pipe += c.user_data.len();
+            self.stats.inc_fast_retrans();
+            c.nsent += 1;
+            c.last_sent = Some(now);
+            c.lost_again = false;
+            Association::check_partial_reliability_status(
+                c,
+                now,
+                self.use_forward_tsn,
+                self.side,
+                &self.streams,
+            );
+            trace!(
+                "[{}] fast-retransmit: tsn={} sent={} htna={}",
+                self.side, c.tsn, c.nsent, self.fast_recover_exit_point
+            );
+            packet.push(c.clone());
+        }
+        if !packet.is_empty() {
+            packets.push(packet);
+        }
+        if packets.is_empty() {
+            return raw_packets;
+        }
+
+        for mut chunks in packets {
+            // A repaired hole would otherwise wait for the peer's delayed
+            // SACK, which can outlast T3-rtx on long paths (RFC 7053).
+            if let Some(last) = chunks.last_mut() {
+                last.immediate_sack = true;
+            }
+            let chunks = chunks
+                .into_iter()
+                .map(|c| Box::new(c) as Box<dyn Chunk + Send + Sync>)
+                .collect();
+            if let Ok(raw) = self.create_packet(chunks).marshal() {
+                raw_packets.push(raw);
+            } else {
+                warn!(
+                    "[{}] failed to serialize a DATA packet to be fast-retransmitted",
+                    self.side
+                );
             }
         }
+
+        // A repair lost in a quiet tail draws no SACK to report it, so
+        // probe it as RFC 8985 section 7.2 probes new data.
+        self.arm_loss_probe(now);
 
         raw_packets
     }
@@ -3999,6 +4029,8 @@ impl Association {
                 // reset the retransmit flag not to retransmit again before the next
                 // t3-rtx timer fires
                 c.retransmit = false;
+                // This resend also settles a fast retransmission still owed.
+                c.lost_again = false;
                 bytes_to_send += c.user_data.len();
 
                 c.nsent += 1;
@@ -4377,7 +4409,7 @@ impl Association {
         self.awake_write_loop();
     }
 
-    fn on_retransmission_timeout(&mut self, timer_id: Timer, n_rtos: usize) {
+    fn on_retransmission_timeout(&mut self, timer_id: Timer, n_rtos: usize, now: Instant) {
         match timer_id {
             Timer::T1Init => {
                 if let Err(err) = self.send_init() {
@@ -4462,6 +4494,7 @@ impl Association {
 
                 self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
+                self.recovery_reduced_at = Some(now);
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.side,
