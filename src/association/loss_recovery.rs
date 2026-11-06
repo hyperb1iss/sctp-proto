@@ -22,8 +22,9 @@
 //!   time, retransmissions included (section 3.1).
 //!
 //! Repairs leave as the congestion window allows, and a repair lost in a
-//! quiet tail is probed like new data. A lost retransmission lowers the
-//! window once more, once per round of repairs (section 9.3).
+//! quiet tail, or one the window holds back, is probed like new data. A lost
+//! retransmission lowers the window once more, once per round of repairs
+//! (section 9.3).
 
 use super::*;
 
@@ -128,10 +129,12 @@ fn sent_after(a: (Instant, u32), b: (Instant, u32)) -> bool {
 
 /// Whether fast retransmission owes this chunk a resend: three miss
 /// indications on its first transmission, or RACK finding a retransmission
-/// lost.
+/// lost. A chunk T3-rtx has queued is T3-rtx's to send, and fast
+/// retransmission sending it too would put it on the wire twice.
 pub(super) fn awaits_fast_retransmit(c: &ChunkPayloadData) -> bool {
     !c.acked
         && !c.abandoned()
+        && !c.retransmit
         && (c.lost_again || (c.nsent == 1 && c.miss_indicator >= FAST_RETRANSMIT_THRESHOLD as u32))
 }
 
@@ -264,15 +267,23 @@ impl Association {
         if d.abandoned {
             return;
         }
-        let Some(sent) = d.last_sent else {
+        let Some(mut sent) = d.last_sent else {
             return;
         };
-        let rtt = now.saturating_duration_since(sent);
+        let mut rtt = now.saturating_duration_since(sent);
         if d.nsent == 1 {
             self.rack.min_rtt = Some(self.rack.min_rtt.map_or(rtt, |m| m.min(rtt)));
         } else if self.rack.min_rtt.is_none_or(|min_rtt| rtt < min_rtt) {
-            // Too fast to acknowledge the retransmission: likely the original.
-            return;
+            // Too fast to acknowledge the retransmission, so an earlier
+            // transmission arrived. RFC 8985 section 6.2 ignores such a
+            // delivery, but when a probe just left that would blind RACK
+            // to a flight whose only news is this SACK. The first send is
+            // the one time that cannot overstate what was delivered.
+            let Some(first_sent) = d.since else {
+                return;
+            };
+            sent = first_sent;
+            rtt = now.saturating_duration_since(first_sent);
         }
         if self
             .rack
@@ -374,6 +385,7 @@ impl Association {
             // exiting once the highest outstanding TSN is acknowledged.
             self.on_fast_recovery_entered();
             self.in_fast_recovery = true;
+            self.fast_retransmit_ignores_cwnd = true;
             self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
             self.reduce_window_for_loss(lost_retransmission.is_some(), now);
         } else if lost_since_reduction {
@@ -453,12 +465,17 @@ impl Association {
             .then(|| Duration::from_millis(self.rto_mgr.srtt.saturating_mul(2)).max(PTO_MIN))
     }
 
-    /// The highest outstanding TSN when the flight is a quiet tail a probe
-    /// may repair: nothing queued and no retransmission pending. Outside
-    /// fast recovery the flight must also be all first transmissions with no
-    /// reported holes. Fast recovery qualifies once its repairs have left,
-    /// since a lost tail past the repaired holes, or a lost repair, draws no
-    /// SACK to report it.
+    /// The chunk to probe when the flight is a quiet tail: nothing queued
+    /// and nothing T3-rtx has queued. Outside loss recovery the flight must
+    /// also be all first transmissions with no reported holes. Recovery
+    /// qualifies once its repairs have left, since a lost tail past the
+    /// repaired holes, or a lost repair, draws no SACK to report it.
+    ///
+    /// The probe takes the first chunk still owed a repair the window would
+    /// not let out, which is unsent as far as the peer is concerned, the way
+    /// RFC 8985 section 7.3 prefers new data. Its SACK then lets RACK judge
+    /// the repairs that left before it. Otherwise it takes the highest
+    /// outstanding TSN.
     fn tail_probe_candidate(&self) -> Option<u32> {
         if !matches!(
             self.state,
@@ -467,24 +484,33 @@ impl Association {
                 | AssociationState::ShutdownReceived
         ) || self.loss_probe.is_some()
             || self.will_send_probe.is_some()
+            || self.will_retransmit_fast
             || !self.pending_queue.is_empty()
         {
             return None;
         }
-        let mut candidate = None;
+        let mut owed = None;
+        let mut tail = None;
+        let mut first_transmissions_only = true;
         for tsn in &self.inflight_queue.sorted {
             let c = self.inflight_queue.get(*tsn)?;
-            if c.retransmit || awaits_fast_retransmit(c) {
+            if c.retransmit {
                 return None;
             }
-            if !self.in_fast_recovery && (c.acked || c.nsent != 1) {
-                return None;
-            }
-            if !c.acked {
-                candidate = Some(*tsn);
+            first_transmissions_only &= !c.acked && c.nsent == 1;
+            if awaits_fast_retransmit(c) {
+                owed = owed.or(Some(*tsn));
+            } else if !c.acked {
+                tail = Some(*tsn);
             }
         }
-        let tsn = candidate?;
+        if owed.is_some() {
+            return owed;
+        }
+        if !self.in_fast_recovery && !first_transmissions_only {
+            return None;
+        }
+        let tsn = tail?;
         (!self.inflight_queue.get(tsn)?.abandoned()).then_some(tsn)
     }
 
@@ -493,6 +519,7 @@ impl Association {
     /// Either event also replaces a probe chosen but not yet sent: new data
     /// probes the path itself, and progress shows the tail is not quiet.
     pub(super) fn arm_loss_probe(&mut self, now: Instant) {
+        self.close_moot_probe_verdict();
         // RFC 8985 section 7.3 allows one probe until its outcome is known.
         if self.loss_probe.is_some() {
             return;
@@ -511,6 +538,30 @@ impl Association {
             return;
         }
         self.timers.set(Timer::Probe, Some(at));
+    }
+
+    /// A verdict decides one window reduction and one delivery report. Once
+    /// fast recovery has taken the reduction for the probed loss only the
+    /// report is left, and that must not hold up the probe of whatever
+    /// recovery is still waiting on. The report stands as a loss, which a
+    /// late duplicate could have corrected by one transmission.
+    fn close_moot_probe_verdict(&mut self) {
+        let moot = self.loss_probe.as_ref().is_some_and(|episode| {
+            episode.awaiting.is_some()
+                && episode.window_reduced
+                && episode.probed_retransmission.is_none()
+        });
+        if !moot {
+            return;
+        }
+        if let Some(ProbeEpisode {
+            awaiting: Some(report),
+            ..
+        }) = self.loss_probe.take()
+        {
+            self.timers.stop(Timer::Probe);
+            self.push_delivery_report(report);
+        }
     }
 
     /// Stop a running probe timer when the flight no longer qualifies,
@@ -595,6 +646,7 @@ impl Association {
         let probed_retransmission = c.last_sent.filter(|_| c.nsent > 1);
         c.nsent += 1;
         c.last_sent = Some(now);
+        c.lost_again = false;
         Association::check_partial_reliability_status(
             c,
             now,

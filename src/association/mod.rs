@@ -322,6 +322,9 @@ pub struct Association {
     /// since then and lost again earns another reduction (RFC 8985
     /// section 9.3, RFC 5681 section 4.3).
     recovery_reduced_at: Option<Instant>,
+    /// Fast recovery just began, so its first repair packet leaves whatever
+    /// cwnd says (RFC 9260 section 7.2.4 step 3).
+    fast_retransmit_ignores_cwnd: bool,
 
     // Tail loss probe (RFC 8985 section 7)
     /// TSN chosen by an expired probe timer, sent by the next transmit poll.
@@ -438,6 +441,7 @@ impl Default for Association {
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
             recovery_reduced_at: None,
+            fast_retransmit_ignores_cwnd: false,
 
             will_send_probe: None,
             loss_probe: None,
@@ -3318,6 +3322,7 @@ impl Association {
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
+                            self.fast_retransmit_ignores_cwnd = true;
                             self.recovery_reduced_at = Some(now);
 
                             trace!(
@@ -3337,9 +3342,10 @@ impl Association {
             }
         }
 
-        // Progress, or any acknowledgement that shrinks the flight, may let
-        // repairs still owed go out (RFC 9260 section 7.2.4 rule 5).
-        if self.in_fast_recovery && (cum_tsn_ack_point_advanced || self.fast_retransmit_due()) {
+        // Any acknowledgement that shrinks the flight may let repairs still
+        // owed go out (RFC 9260 section 7.2.4 rule 5). They stay owed past
+        // the exit point of a recovery that has ended.
+        if (self.in_fast_recovery && cum_tsn_ack_point_advanced) || self.fast_retransmit_due() {
             self.will_retransmit_fast = true;
         }
         if self.in_fast_recovery && !was_in_fast_recovery {
@@ -3811,12 +3817,14 @@ impl Association {
         self.spurious_recovery.invalidate();
         self.will_retransmit_fast = false;
 
-        // RFC 9260 section 7.2.4 step 3 sends the earliest chunks marked for
-        // fast retransmission that fit one packet at once, whatever cwnd
-        // says. Step 5 keeps the rest marked, "retransmitted later on as
-        // soon as cwnd allows". Count the flight as RFC 6675 counts its
-        // pipe: every outstanding byte except those already declared lost,
-        // which their repairs replace.
+        // On entering fast recovery, RFC 9260 section 7.2.4 step 3 sends the
+        // earliest chunks marked for fast retransmission that fit one packet
+        // at once, whatever cwnd says. Step 5 keeps the rest marked,
+        // "retransmitted later on as soon as cwnd allows", and RFC 8985
+        // section 9.3 holds later repairs to the same rule. Count the flight
+        // as RFC 6675 counts its pipe: every outstanding byte except those
+        // already declared lost, which their repairs replace.
+        let ignores_cwnd = core::mem::take(&mut self.fast_retransmit_ignores_cwnd);
         let due: Vec<u32> = self
             .inflight_queue
             .sorted
@@ -3850,7 +3858,8 @@ impl Association {
                 packets.push(core::mem::take(&mut packet));
                 packet_size = COMMON_HEADER_SIZE;
             }
-            if !packets.is_empty() && pipe + c.user_data.len() > self.cwnd as usize {
+            let in_waived_packet = ignores_cwnd && packets.is_empty();
+            if !in_waived_packet && pipe + c.user_data.len() > self.cwnd as usize {
                 break;
             }
 
@@ -3876,10 +3885,6 @@ impl Association {
         if !packet.is_empty() {
             packets.push(packet);
         }
-        if packets.is_empty() {
-            return raw_packets;
-        }
-
         for mut chunks in packets {
             // A repaired hole would otherwise wait for the peer's delayed
             // SACK, which can outlast T3-rtx on long paths (RFC 7053).
@@ -3900,8 +3905,9 @@ impl Association {
             }
         }
 
-        // A repair lost in a quiet tail draws no SACK to report it, so
-        // probe it as RFC 8985 section 7.2 probes new data.
+        // A repair lost in a quiet tail draws no SACK to report it, and
+        // neither does one the window holds back, so probe them as RFC 8985
+        // section 7.2 probes new data.
         self.arm_loss_probe(now);
 
         raw_packets

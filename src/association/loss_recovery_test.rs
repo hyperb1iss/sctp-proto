@@ -1145,3 +1145,165 @@ fn random_loss_only_repairs_what_was_lost() {
         );
     }
 }
+
+#[test]
+fn a_repair_lost_right_after_a_probe_is_probed_two_srtt_later() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 20 * mtu;
+    let cwnd = pair.peers[0].cwnd;
+    let first = pair.next_tsn();
+    // The probe of the tail arrives while its verdict window covers the
+    // repair the SACK sets off, and that repair is lost.
+    pair.drop_tsns.extend([first, first + 1, first]);
+    for index in 0..2u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    // Fast recovery already took the window reduction the verdict would
+    // decide, so the verdict must not hold up the next probe.
+    pair.run(1000);
+    let attempts = pair.transmissions_of(first);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[2].at - attempts[1].at, 2 * SRTT);
+    assert_eq!(pair.received[1].len(), 2);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(stats.get_num_loss_probes(), 2);
+    assert_eq!(pair.peers[0].ssthresh, cwnd / 4);
+}
+
+#[test]
+fn repairs_the_window_holds_back_are_probed() {
+    let mut pair = Pair::warmed_up();
+    pair.peers[0].cwnd = 8 * pair.peers[0].mtu;
+    let first = pair.next_tsn();
+    // Seven of eight chunks are lost, and so is every repair the halved
+    // window lets out, which leaves three more owed and no SACK to come.
+    pair.drop_tsns.extend(first..first + 7);
+    pair.drop_tsns.extend(first..first + 4);
+    for index in 0..8u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    pair.run(1000);
+    let repaired_at = pair.transmissions_of(first)[1].at;
+    let probe = &pair.transmissions_of(first + 4)[1];
+    assert_eq!(probe.at, repaired_at + 2 * SRTT);
+    assert!(probe.chunk.immediate_sack);
+    assert_eq!(pair.received[1].len(), 8);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(stats.get_num_loss_probes(), 1);
+}
+
+#[test]
+fn repairs_owed_past_the_recovery_exit_still_leave() {
+    let mut pair = Pair::warmed_up();
+    pair.spacing = Duration::from_millis(1);
+    pair.peers[0].cwnd = 30 * pair.peers[0].mtu;
+    let first = pair.next_tsn();
+    // A three-miss recovery exits at the highest TSN acknowledged so far.
+    // The long run lost past it is marked within that recovery, and part
+    // of it is still owed when the recovery ends.
+    pair.drop_tsns.extend([first, first]);
+    pair.drop_tsns.extend(first + 5..first + 25);
+    for index in 0..30u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    pair.run(1000);
+    assert_eq!(pair.received[1].len(), 30);
+    assert_eq!(pair.stats().get_num_t3timeouts(), 0);
+    assert!(pair.peers[0].inflight_queue.is_empty());
+}
+
+#[test]
+fn t3_owns_the_chunks_it_queues() {
+    let mut pair = Pair::warmed_up();
+    pair.peers[0].cwnd = 40 * pair.peers[0].mtu;
+    let first = pair.next_tsn();
+    // Every chunk but the last is lost, then the 23 repairs the halved
+    // window lets out, then the probe of the 24th. T3-rtx queues the whole
+    // flight, and its first SACK lands while most of it is still queued,
+    // with sixteen repairs owed since before the timeout.
+    pair.drop_tsns.extend(first..first + 39);
+    pair.drop_tsns.extend(first..first + 24);
+    for index in 0..40u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    pair.run(3000);
+    assert_eq!(pair.received[1].len(), 40);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 1);
+    assert_eq!(stats.get_num_loss_probes(), 1);
+    for tsn in first..first + 39 {
+        let attempts = pair.transmissions_of(tsn);
+        let delivered = attempts.iter().filter(|t| !t.dropped).count();
+        assert_eq!(delivered, 1, "tsn {tsn} left {} times", attempts.len());
+    }
+}
+
+#[test]
+fn only_the_packet_that_enters_recovery_ignores_the_window() {
+    let mut pair = Pair::warmed_up();
+    let mtu = pair.peers[0].mtu;
+    pair.peers[0].cwnd = 8 * mtu;
+    // Each repair draws its own SACK, so each pass finds the window full.
+    pair.spacing = Duration::from_millis(5);
+    let first = pair.next_tsn();
+    pair.drop_tsns.extend(first..first + 7);
+    for index in 0..8u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    // The first four repairs leave, and the window then shrinks under
+    // them. Two SACKs later two repairs are still in flight, a full window.
+    while pair.transmissions_of(first).len() < 2 {
+        pair.tick();
+    }
+    pair.peers[0].cwnd = 2 * mtu;
+    let held = first + 4;
+    while pair.received[1].len() < 2 {
+        pair.tick();
+        assert_eq!(pair.transmissions_of(held).len(), 1, "over the window");
+    }
+    pair.run(1000);
+    assert_eq!(pair.received[1].len(), 8);
+    assert_eq!(pair.stats().get_num_t3timeouts(), 0);
+}
+
+#[test]
+fn a_sack_that_beats_its_probe_still_lets_rack_judge_the_flight() {
+    let mut pair = Pair::warmed_up();
+    pair.peers[0].cwnd = 8 * pair.peers[0].mtu;
+    // A slow link clocks the tail out after the probe timer fires, so the
+    // original's SACK lands too soon after the probe to be the probe's.
+    pair.spacing = Duration::from_millis(5);
+    let first = pair.next_tsn();
+    pair.drop_tsns.extend(first..first + 7);
+    for index in 0..8u8 {
+        let message = vec![index; PAYLOAD_SIZE as usize];
+        pair.peers[0].stream(1).unwrap().write(&message).unwrap();
+    }
+    pair.flush();
+
+    pair.run(1000);
+    let tail = pair.transmissions_of(first + 7);
+    assert_eq!(tail.len(), 2, "the probe left before the SACK landed");
+    assert_eq!(pair.received[1].len(), 8);
+    let mut stats = pair.stats();
+    assert_eq!(stats.get_num_t3timeouts(), 0);
+    assert_eq!(stats.get_num_early_retrans(), 7);
+}
